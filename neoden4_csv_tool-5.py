@@ -3692,10 +3692,16 @@ function updateSectionVisibility() {
 }
 
 function updateActiveRotButtons(rotVal) {
-  [-90, 0, 90, 180].forEach(deg => {
-    const btn = document.getElementById('rotBtn_' + deg);
+  const rotMap = {
+    0: 'rotOff0',
+    '-90': 'rotOffM90',
+    90: 'rotOffP90',
+    180: 'rotOff180'
+  };
+  Object.keys(rotMap).forEach(k => {
+    const btn = document.getElementById(rotMap[k]);
     if (btn) {
-      btn.classList.toggle('active', Math.abs((rotVal || 0) - deg) < 0.01);
+      btn.classList.toggle('active', Math.abs((rotVal || 0) - Number(k)) < 0.01);
     }
   });
 }
@@ -4043,9 +4049,14 @@ function selectComponent(rowIndex, scrollToRow = false) {
 }
 
 function updateSelectedHud() {
-  const hud = document.getElementById('selectedCompHud');
+  const hud = document.getElementById('locatorHud');
+  const txt = document.getElementById('locatorText');
+  const act = document.getElementById('locatorActions');
   if (!hud || !currentData || selectedRowIndex === null || !currentData.components[selectedRowIndex]) {
-    if (hud) hud.style.display = 'none';
+    if (txt) {
+      txt.innerHTML = '<strong>FR1 Component Locator:</strong> Click any component pad on the board map above or any row below to see its exact distance from Fiducial 1 &amp; Board Origin.';
+    }
+    if (act) act.style.display = 'none';
     return;
   }
   const c = currentData.components[selectedRowIndex];
@@ -4054,10 +4065,13 @@ function updateSelectedHud() {
   const dx = c.new_x - fidX;
   const dy = c.new_y - fidY;
 
-  hud.style.display = 'flex';
-  document.getElementById('hudCompName').textContent = `${c.name} (${c.value} / ${c.footprint || '—'})`;
-  document.getElementById('hudCompCoords').textContent = `X=${fmtCoord(c.new_x, 4)}, Y=${fmtCoord(c.new_y, 4)} mm | Rot=${fmtCoord(c.new_rot, 1)}° | F${c.feeder_id}`;
-  document.getElementById('hudCompDelta').textContent = `Δ from Fid 1: ΔX=${dx >= 0 ? '+' : ''}${fmtCoord(dx, 3)} mm, ΔY=${dy >= 0 ? '+' : ''}${fmtCoord(dy, 3)} mm`;
+  if (txt) {
+    txt.innerHTML = `<strong>${escapeHtml(c.name)}</strong> (${escapeHtml(c.value)} / ${escapeHtml(c.footprint || '—')}) &mdash; ` +
+      `<strong>Pos:</strong> X=${fmtCoord(c.new_x, 4)}, Y=${fmtCoord(c.new_y, 4)} mm | ` +
+      `<strong>Rot:</strong> ${fmtCoord(c.new_rot, 1)}° | <strong>Feeder:</strong> #${c.feeder_id} (H${c.yy1_head || 1}) | ` +
+      `<span style="color:#7e22ce;font-weight:700;">Δ from Fid 1: ΔX=${dx >= 0 ? '+' : ''}${fmtCoord(dx, 3)} mm, ΔY=${dy >= 0 ? '+' : ''}${fmtCoord(dy, 3)} mm</span>`;
+  }
+  if (act) act.style.display = 'inline-flex';
 }
 
 function estimateFootprintSize(fp, name) {
@@ -4465,20 +4479,25 @@ async function redoEdit() {
 
 function switchTab(tabName) {
   const isAdv = (tabName === 'adv');
-  document.getElementById('mainTabPane').style.display = isAdv ? 'none' : 'flex';
-  document.getElementById('advTabPane').style.display = isAdv ? 'flex' : 'none';
-  document.getElementById('tabBtnMain').classList.toggle('active', !isAdv);
-  document.getElementById('tabBtnAdv').classList.toggle('active', isAdv);
+  const mainPane = document.getElementById('mainTabPane');
+  const advPane = document.getElementById('advTabPane');
+  const tabMain = document.getElementById('tabBtnMain');
+  const tabAdv = document.getElementById('tabBtnAdv');
+  if (mainPane) mainPane.style.display = isAdv ? 'none' : 'flex';
+  if (advPane) advPane.style.display = isAdv ? 'flex' : 'none';
+  if (tabMain) tabMain.classList.toggle('active', !isAdv);
+  if (tabAdv) tabAdv.classList.toggle('active', isAdv);
 }
 
 function toggleTarget3Unlock() {
-  const unlocked = document.getElementById('unlockTarget3').checked;
+  const chk = document.getElementById('unlockTarget3');
+  const unlocked = chk ? chk.checked : true;
   const opt3 = document.getElementById('optTarget3');
   if (!opt3) return;
   opt3.style.display = unlocked ? '' : 'none';
   opt3.disabled = !unlocked;
   const sel = document.getElementById('targetFormat');
-  if (!unlocked && sel.value === 'neoden_yy1_import') {
+  if (!unlocked && sel && sel.value === 'neoden_yy1_import') {
     sel.value = 'neoden_yy1';
     onTargetFormatChange();
   }
@@ -4510,8 +4529,8 @@ async function exportTarget3Directly() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  document.getElementById('advActionFeedback').textContent =
-    `Exported Target 3 (YY1 11-Col Import): ${data.download_name}`;
+  const fb = document.getElementById('advActionFeedback') || document.getElementById('batchFeedback');
+  if (fb) fb.textContent = `Exported Target 3 (YY1 11-Col Import): ${data.download_name}`;
 }
 
 async function runAdvancedAction(actionType, param = '') {
@@ -4522,9 +4541,9 @@ async function runAdvancedAction(actionType, param = '') {
   const bodyObj = {
     action: actionType,
     param: param,
-    start_feeder: parseInt(document.getElementById('autoFeederStart').value, 10) || 1,
-    alt_heads: document.getElementById('autoAltHeads').checked,
-    mirror_width_x: parseFloat(document.getElementById('mirrorWidthX').value) || parseFloat(document.getElementById('yy1UnitLen').value) || 0.0,
+    start_feeder: parseInt(document.getElementById('autoFeederStart')?.value || '1', 10) || 1,
+    alt_heads: Boolean(document.getElementById('autoAltHeads')?.checked),
+    mirror_width_x: parseFloat(document.getElementById('mirrorWidthX')?.value || document.getElementById('yy1UnitLen')?.value || '0') || 0.0,
     ...collectPreviewParams('custom')
   };
   const res = await fetch('/api/advanced_action', {
@@ -4533,11 +4552,12 @@ async function runAdvancedAction(actionType, param = '') {
     body: JSON.stringify(bodyObj)
   });
   const payload = await res.json();
+  const fb = document.getElementById('advActionFeedback') || document.getElementById('batchFeedback');
   if (payload.error) {
-    document.getElementById('advActionFeedback').textContent = 'Error: ' + payload.error;
+    if (fb) fb.textContent = 'Error: ' + payload.error;
     return;
   }
-  document.getElementById('advActionFeedback').textContent = payload.batch_message || 'Applied advanced action.';
+  if (fb) fb.textContent = payload.batch_message || 'Applied advanced action.';
   applyLoadedState(payload, false);
 }
 
