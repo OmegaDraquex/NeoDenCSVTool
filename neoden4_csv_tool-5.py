@@ -3215,7 +3215,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
       <a href="/help" target="_blank" rel="noopener" class="help-box" title="Opens a detailed guide in a new tab">
         &#128214; Help Guide
       </a>
-      <span class="badge">v7.3</span>
+      <span class="badge">v7.4</span>
     </div>
   </div>
 
@@ -4332,7 +4332,7 @@ function renderDiagnostics(payload) {
     lines.push(`[!] ${w}`);
   });
   const box = document.getElementById('diagBox');
-  if (box) box.textContent = lines.join('\n');
+  if (box) box.textContent = lines.join('\\n');
 }
 
 function renderTable(comps) {
