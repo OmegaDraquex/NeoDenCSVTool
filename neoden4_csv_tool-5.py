@@ -3215,7 +3215,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
       <a href="/help" target="_blank" rel="noopener" class="help-box" title="Opens a detailed guide in a new tab">
         &#128214; Help Guide
       </a>
-      <span class="badge">v7.0</span>
+      <span class="badge">v7.2</span>
     </div>
   </div>
 
