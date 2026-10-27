@@ -3625,14 +3625,34 @@ document.getElementById('fileInput').addEventListener('change', async (ev) => {
     alert('File is larger than 5 MB. Please select a valid NeoDen 4, NeoDen YY1, or KiCad .pos CSV file.');
     return;
   }
-  const buf = await file.arrayBuffer();
-  const res = await fetch('/api/upload?filename=' + encodeURIComponent(file.name), {
-    method: 'POST',
-    body: buf
-  });
-  const payload = await res.json();
-  selectedRowIndex = null;
-  applyLoadedState(payload, true);
+  const statusEl = document.getElementById('statusBar');
+  if (statusEl) statusEl.textContent = 'Uploading and parsing ' + file.name + '...';
+
+  try {
+    const buf = await file.arrayBuffer();
+    const res = await fetch('/api/upload?filename=' + encodeURIComponent(file.name), {
+      method: 'POST',
+      body: buf
+    });
+    if (!res.ok) {
+      const errTxt = await res.text();
+      let errMsg = errTxt;
+      try {
+        const j = JSON.parse(errTxt);
+        if (j.error) errMsg = j.error;
+      } catch (e) {}
+      alert('Upload failed: ' + errMsg);
+      if (statusEl) statusEl.textContent = 'Upload failed: ' + errMsg;
+      return;
+    }
+    const payload = await res.json();
+    selectedRowIndex = null;
+    applyLoadedState(payload, true);
+  } catch (err) {
+    console.error('File upload error:', err);
+    alert('Failed to process file: ' + (err.message || err));
+    if (statusEl) statusEl.textContent = 'Error processing file: ' + (err.message || err);
+  }
 });
 
 function updateTargetFormatHelp() {
