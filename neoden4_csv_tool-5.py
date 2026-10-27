@@ -3215,7 +3215,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
       <a href="/help" target="_blank" rel="noopener" class="help-box" title="Opens a detailed guide in a new tab">
         &#128214; Help Guide
       </a>
-      <span class="badge">v7.2</span>
+      <span class="badge">v7.3</span>
     </div>
   </div>
 
@@ -3591,6 +3591,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
+console.log('NeoDen Tool v7.3 initialized');
 let currentData = null;
 let selectedRowIndex = null;
 
@@ -3618,22 +3619,34 @@ function nudge(inputId, delta) {
   recalculate();
 }
 
-document.getElementById('fileInput').addEventListener('change', async (ev) => {
-  const file = ev.target.files[0];
+async function handleFileSelected(file) {
   if (!file) return;
+  console.log('Selected file:', file.name, 'Size:', file.size, 'bytes');
+
+  const tagEl = document.getElementById('sourceFormatTag');
+  if (tagEl) {
+    tagEl.textContent = 'Loading ' + file.name + '...';
+    tagEl.style.background = '#fef08a';
+    tagEl.style.color = '#854d0e';
+  }
+
+  const statusEl = document.getElementById('statusBar');
+  if (statusEl) statusEl.textContent = 'Uploading and parsing ' + file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)...';
+
   if (file.size > 5 * 1024 * 1024) {
     alert('File is larger than 5 MB. Please select a valid NeoDen 4, NeoDen YY1, or KiCad .pos CSV file.');
+    if (tagEl) tagEl.textContent = 'File too large';
     return;
   }
-  const statusEl = document.getElementById('statusBar');
-  if (statusEl) statusEl.textContent = 'Uploading and parsing ' + file.name + '...';
 
   try {
     const buf = await file.arrayBuffer();
+    console.log('Read arrayBuffer, uploading to /api/upload...');
     const res = await fetch('/api/upload?filename=' + encodeURIComponent(file.name), {
       method: 'POST',
       body: buf
     });
+
     if (!res.ok) {
       const errTxt = await res.text();
       let errMsg = errTxt;
@@ -3641,19 +3654,45 @@ document.getElementById('fileInput').addEventListener('change', async (ev) => {
         const j = JSON.parse(errTxt);
         if (j.error) errMsg = j.error;
       } catch (e) {}
+      console.error('Server returned error on upload:', errMsg);
       alert('Upload failed: ' + errMsg);
       if (statusEl) statusEl.textContent = 'Upload failed: ' + errMsg;
+      if (tagEl) {
+        tagEl.textContent = 'Error';
+        tagEl.style.background = '#fecaca';
+        tagEl.style.color = '#991b1b';
+      }
       return;
     }
+
     const payload = await res.json();
+    console.log('Upload successful! Received payload with', (payload.components || []).length, 'components. Applying state...');
     selectedRowIndex = null;
     applyLoadedState(payload, true);
+    console.log('applyLoadedState finished successfully!');
   } catch (err) {
-    console.error('File upload error:', err);
+    console.error('File upload exception:', err);
     alert('Failed to process file: ' + (err.message || err));
     if (statusEl) statusEl.textContent = 'Error processing file: ' + (err.message || err);
+    if (tagEl) {
+      tagEl.textContent = 'Failed';
+      tagEl.style.background = '#fecaca';
+      tagEl.style.color = '#991b1b';
+    }
   }
-});
+}
+
+const fileInputEl = document.getElementById('fileInput');
+if (fileInputEl) {
+  fileInputEl.addEventListener('change', (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    handleFileSelected(file);
+  });
+  fileInputEl.addEventListener('input', (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    handleFileSelected(file);
+  });
+}
 
 function updateTargetFormatHelp() {
   const targetFmt = document.getElementById('targetFormat').value;
