@@ -290,6 +290,11 @@ class NeoDenCSVAnalysis:
   )
   has_negative_coords: bool = False
 
+  # NeoDen 4 Machine Rail Clamp Offset (auto-applied when exporting KiCad .pos to NeoDen 4):
+  n4_rail_offset_enabled: bool = True
+  n4_rail_offset_x: float = 70.57
+  n4_rail_offset_y: float = 37.52
+
   edge_angles: Dict[str, float] = field(default_factory=dict)
   recommended_angle_deg: float = 0.0
   recommended_method: str = ""
@@ -1299,6 +1304,9 @@ def parse_neoden_csv_bytes(
   # Route NeoDen YY1 files through the dedicated YY1 parser
   if csv_type in ("neoden_yy1", "neoden_yy1_import"):
     _populate_yy1_Into_neoden_analysis(text, analysis)
+    analysis.n4_rail_offset_enabled = False
+    analysis.n4_rail_offset_x = 0.0
+    analysis.n4_rail_offset_y = 0.0
     analysis.recommended_angle_deg = 0.0
     analysis.recommended_method = "NeoDen YY1 File (Preserving Coordinates)"
     analysis.warnings.append(
@@ -1329,8 +1337,14 @@ def parse_neoden_csv_bytes(
     )
     analysis.cad_fiducials = cad_fids
     analysis.excluded_parts = excluded_parts
+    analysis.n4_rail_offset_enabled = True
+    analysis.n4_rail_offset_x = 70.57
+    analysis.n4_rail_offset_y = 37.52
   else:
     raw_lines = text.splitlines()
+    analysis.n4_rail_offset_enabled = False
+    analysis.n4_rail_offset_x = 0.0
+    analysis.n4_rail_offset_y = 0.0
 
   for idx, raw_line in enumerate(raw_lines):
     cleaned_line, was_modified = clean_excel_corrupted_line(
@@ -2264,6 +2278,9 @@ def apply_transformation(
     yy1_offset_y: Optional[float] = None,
     comp_rot_offset_deg: Optional[float] = None,
     invert_rot_sign: Optional[bool] = None,
+    n4_rail_offset_enabled: Optional[bool] = None,
+    n4_rail_offset_x: Optional[float] = None,
+    n4_rail_offset_y: Optional[float] = None,
 ) -> List[str]:
   """
   Applies coordinate transformations, board rotation, tape rotation offsets,
@@ -2275,6 +2292,19 @@ def apply_transformation(
 
   if skip_mode != "custom" or custom_skips:
     apply_skip_mode(analysis, skip_mode, custom_skips)
+
+  if n4_rail_offset_enabled is not None:
+    analysis.n4_rail_offset_enabled = bool(n4_rail_offset_enabled)
+  if n4_rail_offset_x is not None:
+    analysis.n4_rail_offset_x = float(n4_rail_offset_x)
+  if n4_rail_offset_y is not None:
+    analysis.n4_rail_offset_y = float(n4_rail_offset_y)
+
+  eff_n4_dx = 0.0
+  eff_n4_dy = 0.0
+  if target_format == "neoden4" and analysis.n4_rail_offset_enabled:
+    eff_n4_dx = analysis.n4_rail_offset_x
+    eff_n4_dy = analysis.n4_rail_offset_y
 
   rot_off = (
       float(comp_rot_offset_deg)
@@ -2306,8 +2336,8 @@ def apply_transformation(
 
   if is_raw_passthrough:
     for comp in analysis.components:
-      comp.new_x = comp.x
-      comp.new_y = comp.y
+      comp.new_x = round(comp.x + eff_n4_dx, 6)
+      comp.new_y = round(comp.y + eff_n4_dy, 6)
       base_r = -comp.rotation if inv_rot else comp.rotation
       comp.new_rotation = wrap_neoden_angle(base_r + rot_off)
   else:
@@ -2323,13 +2353,13 @@ def apply_transformation(
 
     for idx, comp in enumerate(analysis.components):
       if idx == 0:
-        comp.new_x = target_p1_x
-        comp.new_y = target_p1_y
+        comp.new_x = round(target_p1_x + eff_n4_dx, 6)
+        comp.new_y = round(target_p1_y + eff_n4_dy, 6)
       else:
         dx = comp.x - c1_orig_x
         dy = comp.y - c1_orig_y
-        comp.new_x = target_p1_x + (dx * cos_t - dy * sin_t)
-        comp.new_y = target_p1_y + (dx * sin_t + dy * cos_t)
+        comp.new_x = round(target_p1_x + (dx * cos_t - dy * sin_t) + eff_n4_dx, 6)
+        comp.new_y = round(target_p1_y + (dx * sin_t + dy * cos_t) + eff_n4_dy, 6)
 
       base_r = -comp.rotation if inv_rot else comp.rotation
       if rotate_component_angles:
@@ -2374,8 +2404,20 @@ def apply_transformation(
   out_lines = list(analysis.raw_lines)
   target_p1_x = analysis.components[0].new_x
   target_p1_y = analysis.components[0].new_y
-  p2_x_val = analysis.panels[1].x if len(analysis.panels) >= 2 else target_p1_x
-  p2_y_val = analysis.panels[1].y if len(analysis.panels) >= 2 else target_p1_y
+  p2_x_val = (analysis.panels[1].x + eff_n4_dx) if len(analysis.panels) >= 2 else target_p1_x
+  p2_y_val = (analysis.panels[1].y + eff_n4_dy) if len(analysis.panels) >= 2 else target_p1_y
+
+  # Update mark line with fiducials + eff_n4_dx, eff_n4_dy if present
+  if analysis.mark_line_idx >= 0 and analysis.fiducials:
+    f_coords = []
+    for f in analysis.fiducials[:4]:
+      f_coords.append(f"{f.x + eff_n4_dx:.4f}")
+      f_coords.append(f"{f.y + eff_n4_dy:.4f}")
+    scope = analysis.mark_scope or "Whole"
+    mode = analysis.mark_mode or "Auto"
+    out_lines[analysis.mark_line_idx] = (
+        f"mark,{scope},{mode},{','.join(f_coords)},"
+    )
 
   if analysis.panels:
     p1 = analysis.panels[0]
@@ -3228,7 +3270,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
       <a href="/help" target="_blank" rel="noopener" class="help-box" title="Opens a detailed guide in a new tab">
         &#128214; Help Guide
       </a>
-      <span class="badge">v7.5</span>
+      <span class="badge">v7.6</span>
     </div>
   </div>
 
@@ -3388,6 +3430,28 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
               <label>Y:</label>
               <input type="number" step="0.01" id="originTargetY" value="0.00" style="width:66px;">
               <button type="button" onclick="applyOriginShift()" style="background:#dbeafe;border-color:#3b82f6;color:#1e3a8a;">Shift Coords</button>
+            </div>
+          </div>
+
+          <!-- NeoDen 4 Physical Rail Clamp Offset -->
+          <div id="n4RailOffsetBox" style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;padding:6px 8px;margin-bottom:8px;">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+              <label style="font-size:11px;font-weight:700;color:#1e40af;display:flex;align-items:center;gap:4px;cursor:pointer;">
+                <input type="checkbox" id="n4RailOffsetEnabled" checked onchange="recalculate('custom')">
+                NeoDen 4 Rail Clamp Offset
+              </label>
+              <span id="n4RailTargetBadge" style="font-size:9.5px;color:#2563eb;font-weight:600;background:#dbeafe;padding:1px 5px;border-radius:3px;">NeoDen 4 Target</span>
+            </div>
+            <div class="row" style="margin-bottom:4px;">
+              <label style="width:55px;">Offset X:</label>
+              <input type="number" step="0.01" id="n4RailOffsetX" value="70.57" style="width:64px;" onchange="recalculate('custom')">
+              <label style="margin-left:4px;width:20px;">Y:</label>
+              <input type="number" step="0.01" id="n4RailOffsetY" value="37.52" style="width:64px;" onchange="recalculate('custom')">
+              <button type="button" onclick="setN4RailOffset(0, 0)" style="background:#f1f5f9;border-color:#cbd5e1;color:#475569;font-size:10px;padding:2px 5px;" title="Reset offset to 0.00 mm">Reset to 0</button>
+              <button type="button" onclick="setN4RailOffset(70.57, 37.52)" style="background:#e0e7ff;border-color:#a5b4fc;color:#3730a3;font-size:10px;padding:2px 5px;" title="Restore measured physical rail offset (+70.57, +37.52 mm)">Default</button>
+            </div>
+            <div style="font-size:10px;color:#64748b;line-height:1.2;">
+              Offsets components &amp; fiducial marks to match physical PCB rail clamping position on the NeoDen 4.
             </div>
           </div>
 
@@ -3610,7 +3674,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-console.log('NeoDen Tool v7.5 initialized');
+console.log('NeoDen Tool v7.6 initialized');
 let currentData = null;
 let selectedRowIndex = null;
 
@@ -3795,6 +3859,26 @@ function updateSectionVisibility() {
       }
     }
   }
+
+  const n4RailBox = document.getElementById('n4RailOffsetBox');
+  const n4RailBadge = document.getElementById('n4RailTargetBadge');
+  if (n4RailBox) {
+    if (isYY1Target) {
+      n4RailBox.style.opacity = '0.55';
+      if (n4RailBadge) {
+        n4RailBadge.textContent = 'Inactive (YY1 Selected)';
+        n4RailBadge.style.color = '#64748b';
+        n4RailBadge.style.background = '#f1f5f9';
+      }
+    } else {
+      n4RailBox.style.opacity = '1.0';
+      if (n4RailBadge) {
+        n4RailBadge.textContent = 'Active (NeoDen 4)';
+        n4RailBadge.style.color = '#1d4ed8';
+        n4RailBadge.style.background = '#dbeafe';
+      }
+    }
+  }
 }
 
 function updateActiveRotButtons(rotVal) {
@@ -3858,6 +3942,16 @@ function pickFiducialFromDropdown() {
     document.getElementById('yy1FidY').value = fmtCoord(parseFloat(parts[1]), 4);
     recalculate('custom');
   }
+}
+
+function setN4RailOffset(x, y) {
+  const elX = document.getElementById('n4RailOffsetX');
+  const elY = document.getElementById('n4RailOffsetY');
+  const chk = document.getElementById('n4RailOffsetEnabled');
+  if (elX) elX.value = fmtCoord(x, 2);
+  if (elY) elY.value = fmtCoord(y, 2);
+  if (chk) chk.checked = true;
+  recalculate('custom');
 }
 
 async function applyOriginShift(mode) {
@@ -3945,6 +4039,19 @@ function applyLoadedState(payload, resetInputs) {
     document.getElementById('rotMode').value = 'auto';
     document.getElementById('boardAngle').value = payload.recommended_angle.toFixed(4);
     updateBoardAngleLock();
+
+    if (payload.n4_rail_offset_enabled !== undefined) {
+      const chk = document.getElementById('n4RailOffsetEnabled');
+      if (chk) chk.checked = Boolean(payload.n4_rail_offset_enabled);
+    }
+    if (payload.n4_rail_offset_x !== undefined) {
+      const el = document.getElementById('n4RailOffsetX');
+      if (el) el.value = fmtCoord(payload.n4_rail_offset_x, 2);
+    }
+    if (payload.n4_rail_offset_y !== undefined) {
+      const el = document.getElementById('n4RailOffsetY');
+      if (el) el.value = fmtCoord(payload.n4_rail_offset_y, 2);
+    }
   } else {
     const curRotOff = parseFloat(document.getElementById('yy1RotOffset').value) || 0.0;
     updateActiveRotButtons(curRotOff);
@@ -4423,6 +4530,11 @@ function renderDiagnostics(payload) {
     lines.push(`Edge Angles: ${estr}`);
   }
   lines.push(`Active Rotation: ${payload.active_angle >= 0 ? '+' : ''}${payload.active_angle.toFixed(4)}° (${payload.recommended_method})`);
+  const targetFmt = document.getElementById('targetFormat').value;
+  const isYY1Target = (targetFmt === 'neoden_yy1' || targetFmt === 'neoden_yy1_import');
+  if (!isYY1Target && payload.n4_rail_offset_enabled && (payload.n4_rail_offset_x || payload.n4_rail_offset_y)) {
+    lines.push(`NeoDen 4 Rail Clamp Offset: Active (+${fmtCoord(payload.n4_rail_offset_x, 2)}, +${fmtCoord(payload.n4_rail_offset_y, 2)} mm)`);
+  }
   (payload.warnings || []).forEach(w => {
     lines.push(`[!] ${w}`);
   });
@@ -4756,6 +4868,9 @@ function collectPreviewParams(skipMode = 'custom') {
     p1_y: isKicadStage1N4 ? null : (parseFloat(document.getElementById('p1y').value) || 0.0),
     p2_x: (isKicadStage1N4 || document.getElementById('p2x').disabled) ? null : (parseFloat(document.getElementById('p2x').value) || 0.0),
     p2_y: (isKicadStage1N4 || document.getElementById('p2y').disabled) ? null : (parseFloat(document.getElementById('p2y').value) || 0.0),
+    n4_rail_offset_enabled: document.getElementById('n4RailOffsetEnabled') ? document.getElementById('n4RailOffsetEnabled').checked : false,
+    n4_rail_offset_x: parseFloat(document.getElementById('n4RailOffsetX')?.value || '0.0') || 0.0,
+    n4_rail_offset_y: parseFloat(document.getElementById('n4RailOffsetY')?.value || '0.0') || 0.0,
     rot_comp: document.getElementById('rotComp').checked,
     reset_mc_angle: document.getElementById('resetMcAngle').checked,
     skip_mode: skipMode
@@ -4817,6 +4932,7 @@ def serialize_analysis_state(
     can_undo: bool = False,
     can_redo: bool = False,
     batch_message: str = "",
+    target_format: str = "neoden4",
 ) -> Dict[str, Any]:
   """
   Serializes the current NeoDenCSVAnalysis state into a JSON-friendly dictionary
@@ -4826,9 +4942,17 @@ def serialize_analysis_state(
   c1 = analysis.components[0] if analysis.components else None
   p1 = analysis.panels[0] if analysis.panels else None
   p2 = analysis.panels[1] if len(analysis.panels) >= 2 else None
+
+  eff_n4_dx = 0.0
+  eff_n4_dy = 0.0
+  if target_format == "neoden4" and getattr(analysis, "n4_rail_offset_enabled", False):
+    eff_n4_dx = getattr(analysis, "n4_rail_offset_x", 0.0)
+    eff_n4_dy = getattr(analysis, "n4_rail_offset_y", 0.0)
+
   return {
       "filename": os.path.basename(analysis.filepath),
       "source_format": analysis.source_format,
+      "target_format": target_format,
       "pcb_mode": analysis.pcb_mode,
       "pcb_feed": analysis.pcb_feed_type,
       "mark_scope": analysis.mark_scope,
@@ -4842,6 +4966,9 @@ def serialize_analysis_state(
       "has_p2": p2 is not None,
       "p2_x": p2.x if p2 else 0.0,
       "p2_y": p2.y if p2 else 0.0,
+      "n4_rail_offset_enabled": getattr(analysis, "n4_rail_offset_enabled", True),
+      "n4_rail_offset_x": getattr(analysis, "n4_rail_offset_x", 70.57),
+      "n4_rail_offset_y": getattr(analysis, "n4_rail_offset_y", 37.52),
       "yy1_unit_length": analysis.yy1_unit_length,
       "yy1_unit_width": analysis.yy1_unit_width,
       "yy1_rows": analysis.yy1_rows,
@@ -4864,8 +4991,10 @@ def serialize_analysis_state(
       "fiducials": [
           {
               "index": f.index,
-              "x": f.x,
-              "y": f.y,
+              "x": round(f.x + eff_n4_dx, 4),
+              "y": round(f.y + eff_n4_dy, 4),
+              "raw_x": f.x,
+              "raw_y": f.y,
               "corner": f.corner_label,
               "used": f.used_for_rotation,
               "role_note": f.role_note,
@@ -4911,6 +5040,9 @@ def snapshot_components(
       "panels": copy.deepcopy(analysis.panels),
       "yy1_fid_x": analysis.yy1_fid_x,
       "yy1_fid_y": analysis.yy1_fid_y,
+      "n4_rail_offset_enabled": getattr(analysis, "n4_rail_offset_enabled", True),
+      "n4_rail_offset_x": getattr(analysis, "n4_rail_offset_x", 70.57),
+      "n4_rail_offset_y": getattr(analysis, "n4_rail_offset_y", 37.52),
   }
 
 
@@ -4925,6 +5057,12 @@ def restore_components_snapshot(
     analysis.panels = copy.deepcopy(snap["panels"])
     analysis.yy1_fid_x = snap["yy1_fid_x"]
     analysis.yy1_fid_y = snap["yy1_fid_y"]
+    if "n4_rail_offset_enabled" in snap:
+      analysis.n4_rail_offset_enabled = snap["n4_rail_offset_enabled"]
+    if "n4_rail_offset_x" in snap:
+      analysis.n4_rail_offset_x = snap["n4_rail_offset_x"]
+    if "n4_rail_offset_y" in snap:
+      analysis.n4_rail_offset_y = snap["n4_rail_offset_y"]
   else:
     analysis.components = copy.deepcopy(snap)
 
@@ -5029,6 +5167,12 @@ def launch_web_gui(
         analysis.yy1_rot_offset = float(req["yy1_rot_offset"])
       if req.get("invert_rot_sign") is not None:
         analysis.invert_rot_sign = bool(req["invert_rot_sign"])
+      if req.get("n4_rail_offset_enabled") is not None:
+        analysis.n4_rail_offset_enabled = bool(req["n4_rail_offset_enabled"])
+      if req.get("n4_rail_offset_x") is not None:
+        analysis.n4_rail_offset_x = float(req["n4_rail_offset_x"])
+      if req.get("n4_rail_offset_y") is not None:
+        analysis.n4_rail_offset_y = float(req["n4_rail_offset_y"])
 
       if isinstance(req.get("yy1_nozzle_changes"), list):
         for idx_nc, nc_dict in enumerate(req["yy1_nozzle_changes"][:4]):
@@ -5068,6 +5212,9 @@ def launch_web_gui(
           yy1_offset_y=analysis.yy1_offset_y,
           comp_rot_offset_deg=analysis.yy1_rot_offset,
           invert_rot_sign=analysis.invert_rot_sign,
+          n4_rail_offset_enabled=analysis.n4_rail_offset_enabled,
+          n4_rail_offset_x=analysis.n4_rail_offset_x,
+          n4_rail_offset_y=analysis.n4_rail_offset_y,
       )
       return ang
 
@@ -5106,6 +5253,7 @@ def launch_web_gui(
                   can_undo=False,
                   can_redo=False,
                   batch_message=app_state["last_batch_msg"],
+                  target_format=default_target,
               )
           )
           return
@@ -5116,6 +5264,7 @@ def launch_web_gui(
           return
 
         req = json.loads(body.decode("utf-8")) if body else {}
+        active_target_fmt = req.get("target_format", "neoden4")
 
         if self.path == "/api/preview":
           ang = self._run_preview_from_req(analysis, req)
@@ -5126,6 +5275,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5148,6 +5298,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5168,6 +5319,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5190,6 +5342,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5216,6 +5369,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5239,6 +5393,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5272,6 +5427,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5295,6 +5451,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5318,6 +5475,7 @@ def launch_web_gui(
                   can_undo=bool(app_state["undo_stack"]),
                   can_redo=bool(app_state["redo_stack"]),
                   batch_message=app_state["last_batch_msg"],
+                  target_format=active_target_fmt,
               )
           )
           return
@@ -5325,6 +5483,12 @@ def launch_web_gui(
         if self.path == "/api/export":
           ang = self._run_preview_from_req(analysis, req)
           target_fmt = req.get("target_format", "neoden_yy1")
+          if req.get("n4_rail_offset_enabled") is not None:
+            analysis.n4_rail_offset_enabled = bool(req["n4_rail_offset_enabled"])
+          if req.get("n4_rail_offset_x") is not None:
+            analysis.n4_rail_offset_x = float(req["n4_rail_offset_x"])
+          if req.get("n4_rail_offset_y") is not None:
+            analysis.n4_rail_offset_y = float(req["n4_rail_offset_y"])
           out_lines = apply_transformation(
               analysis,
               board_angle_deg=ang,
@@ -5347,6 +5511,9 @@ def launch_web_gui(
               yy1_offset_y=analysis.yy1_offset_y,
               comp_rot_offset_deg=analysis.yy1_rot_offset,
               invert_rot_sign=analysis.invert_rot_sign,
+              n4_rail_offset_enabled=analysis.n4_rail_offset_enabled,
+              n4_rail_offset_x=analysis.n4_rail_offset_x,
+              n4_rail_offset_y=analysis.n4_rail_offset_y,
           )
           base, _ext = os.path.splitext(analysis.filepath)
           for known_sfx in (
@@ -5534,6 +5701,19 @@ def main() -> int:
       help="Set Panel 2 (top board) SMD1 machine X Y coordinates (mm)",
   )
   parser.add_argument(
+      "--n4-rail-offset",
+      nargs=2,
+      type=float,
+      metavar=("OFFSET_X", "OFFSET_Y"),
+      default=None,
+      help="Set NeoDen 4 machine rail clamp offset in mm (default: 70.57 37.52)",
+  )
+  parser.add_argument(
+      "--no-n4-rail-offset",
+      action="store_true",
+      help="Disable default NeoDen 4 rail clamp offset on KiCad import",
+  )
+  parser.add_argument(
       "--batch-modify",
       nargs=3,
       action="append",
@@ -5598,6 +5778,8 @@ def main() -> int:
           or args.all_edges
           or args.panel1 is not None
           or args.panel2 is not None
+          or args.n4_rail_offset is not None
+          or args.no_n4_rail_offset
           or args.batch_modify is not None
           or args.skips_off
           or args.skips_on
@@ -5617,6 +5799,13 @@ def main() -> int:
     target_fmt = (
         "neoden4" if analysis.source_format == "neoden" else "neoden_yy1"
     )
+
+  if args.n4_rail_offset:
+    analysis.n4_rail_offset_enabled = True
+    analysis.n4_rail_offset_x = float(args.n4_rail_offset[0])
+    analysis.n4_rail_offset_y = float(args.n4_rail_offset[1])
+  elif args.no_n4_rail_offset:
+    analysis.n4_rail_offset_enabled = False
 
   analysis.yy1_rot_offset = float(args.rot_offset)
   analysis.invert_rot_sign = bool(args.invert_rot)
@@ -5676,6 +5865,9 @@ def main() -> int:
       yy1_coord_mode=args.yy1_coord_mode,
       comp_rot_offset_deg=analysis.yy1_rot_offset,
       invert_rot_sign=analysis.invert_rot_sign,
+      n4_rail_offset_enabled=analysis.n4_rail_offset_enabled,
+      n4_rail_offset_x=analysis.n4_rail_offset_x,
+      n4_rail_offset_y=analysis.n4_rail_offset_y,
   )
 
   out_path = args.output
