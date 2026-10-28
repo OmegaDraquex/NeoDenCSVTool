@@ -389,21 +389,19 @@ def clamp_yy1_head(nozzle_str: str) -> Tuple[str, bool]:
 def default_yy1_vision_mode(footprint: str, ref: str = "") -> int:
   """
   Chooses a sensible default NeoDen YY1 recognition mode (0..4) based on package:
-    - Mode 1 (Camera) for standard passives, diodes, and small SOT packages
-    - Mode 3 (Camera + Vacuum) for medium ICs (SOP, SOIC, TSSOP, SSOP, MSOP)
+    - Mode 3 (Camera + Vacuum detection) as standard safe default for passives,
+      diodes, resistors, capacitors, and ICs to ensure parts aren't placed if vacuum lost
     - Mode 4 (Big IC Camera — enlarged FOV) for fine-pitch / large multi-pin ICs
-      (LQFP, TQFP, QFN, BGA)
+      (LQFP, TQFP, QFP, QFN, BGA)
   Why this choice was made:
-  Per the NeoDen YY1 User Manual (Section 3.2.1), Mode 1 is fastest and standard
-  for passives (matching DACdestroyers.csv where passives/LEDs/SOT use Mode 1),
-  while larger ICs benefit from Vacuum check or Enlarged FOV (Mode 3/4).
+  Per operator feedback, Mode 3 (Camera + Vacuum) validates that a component is
+  securely held by suction before the gantry moves to place it, preventing dry hits.
+  Mode 1 (Camera only) and Mode 0 (Fast / Bypass) remain selectable in the UI.
   """
   fp_up = (footprint or "").upper()
   if any(k in fp_up for k in ("LQFP", "TQFP", "QFP", "QFN", "BGA")):
     return 4
-  if any(k in fp_up for k in ("SOP", "SOIC", "TSSOP", "SSOP", "MSOP")):
-    return 3
-  return 1
+  return 3
 
 
 def normalize_kicad_footprint(
@@ -1646,11 +1644,12 @@ def get_part_groups(analysis: NeoDenCSVAnalysis) -> List[Dict[str, Any]]:
         "row_indices": indices,
         "feeder_id": first_comp.feeder_id if len(feeders) == 1 else "Mixed",
         "nozzle": first_comp.nozzle if len(nozzles) == 1 else "Alt",
+        "head": clamp_yy1_head(first_comp.nozzle)[0] if len(heads) == 1 else "Alt",
         "yy1_head": clamp_yy1_head(first_comp.nozzle)[0] if len(heads) == 1 else "Alt",
         "mount_speed": first_comp.mount_speed if len(speeds) == 1 else 50,
         "pick_height": first_comp.pick_height if len(pick_hs) == 1 else 0.0,
         "place_height": first_comp.place_height if len(place_hs) == 1 else 0.0,
-        "yy1_mode": first_comp.yy1_mode if len(modes) == 1 else 1,
+        "yy1_mode": first_comp.yy1_mode if len(modes) == 1 else 3,
         "skip": first_comp.skip if len(skips) == 1 else "Mixed",
     })
   return result
@@ -1691,23 +1690,18 @@ def apply_part_group_edit(
       analysis.components[idx].feeder_id = f_val
     changes_desc.append(f"Feeder={f_val}")
 
-  if "nozzle" in edits and str(edits["nozzle"]).strip() != "":
-    noz_raw = str(edits["nozzle"]).strip().lower()
-    if noz_raw == "alt":
+  if any(k in edits for k in ("nozzle", "head")):
+    raw = str(edits.get("head", edits.get("nozzle", ""))).strip()
+    if raw.lower() in ("alt", "alternate"):
       for k, idx in enumerate(target_indices):
         analysis.components[idx].nozzle = "1" if (k % 2 == 0) else "2"
       changes_desc.append("Head=Alt(1/2)")
-    else:
-      n_val = sanitize_csv_token(str(edits["nozzle"]))
+    elif raw:
+      m_h = re.search(r'\d+', raw)
+      n_val = m_h.group(0) if m_h else sanitize_csv_token(raw)
       for idx in target_indices:
         analysis.components[idx].nozzle = n_val
       changes_desc.append(f"Head={n_val}")
-
-  if "head" in edits and str(edits["head"]).strip() != "":
-    n_val = sanitize_csv_token(str(edits["head"]))
-    for idx in target_indices:
-      analysis.components[idx].nozzle = n_val
-    changes_desc.append(f"Head={n_val}")
 
   if "footprint" in edits and str(edits["footprint"]).strip() != "":
     fp_val = sanitize_csv_token(str(edits["footprint"]))
@@ -1726,6 +1720,7 @@ def apply_part_group_edit(
     for idx in target_indices:
       c = analysis.components[idx]
       c.rotation = wrap_neoden_angle(c.rotation + delta)
+      c.new_rotation = wrap_neoden_angle(c.new_rotation + delta)
     changes_desc.append(f"Rot {delta:+.0f}°")
 
   if "mount_speed" in edits and edits["mount_speed"] is not None:
@@ -1746,11 +1741,17 @@ def apply_part_group_edit(
       analysis.components[idx].place_height = plh
     changes_desc.append(f"PlaceH={plh:g}mm")
 
-  if "yy1_mode" in edits and edits["yy1_mode"] is not None:
-    m_val = max(0, min(4, int(float(edits["yy1_mode"]))))
-    for idx in target_indices:
-      analysis.components[idx].yy1_mode = m_val
-    changes_desc.append(f"Mode=M{m_val}")
+  if any(k in edits for k in ("yy1_mode", "mode")) and (edits.get("yy1_mode") is not None or edits.get("mode") is not None):
+    raw_m = edits.get("yy1_mode") if edits.get("yy1_mode") is not None else edits.get("mode")
+    try:
+      m_digit = re.search(r'\d+', str(raw_m))
+      m_val = int(m_digit.group(0)) if m_digit else int(float(raw_m))
+      m_val = max(0, min(4, m_val))
+      for idx in target_indices:
+        analysis.components[idx].yy1_mode = m_val
+      changes_desc.append(f"Mode=M{m_val}")
+    except (ValueError, TypeError):
+      pass
 
   if "skip" in edits and str(edits["skip"]).strip() in ("Yes", "No"):
     sk_val = str(edits["skip"]).strip()
@@ -1784,12 +1785,10 @@ def apply_single_row_edit(
     comp.feeder_id = sanitize_csv_token(str(edits["feeder_id"]))
     changes.append(f"Feeder={comp.feeder_id}")
 
-  if "nozzle" in edits and str(edits["nozzle"]).strip() != "":
-    comp.nozzle = sanitize_csv_token(str(edits["nozzle"]))
-    changes.append(f"Head={comp.nozzle}")
-
-  if "head" in edits and str(edits["head"]).strip() != "":
-    comp.nozzle = sanitize_csv_token(str(edits["head"]))
+  if any(k in edits for k in ("nozzle", "head")):
+    raw_h = str(edits.get("head", edits.get("nozzle", ""))).strip()
+    m_h = re.search(r'\d+', raw_h)
+    comp.nozzle = m_h.group(0) if m_h else sanitize_csv_token(raw_h)
     changes.append(f"Head={comp.nozzle}")
 
   if "name" in edits and str(edits["name"]).strip() != "":
@@ -1846,9 +1845,14 @@ def apply_single_row_edit(
     comp.place_height = float(edits["place_height"])
     changes.append(f"PlaceH={comp.place_height:g}mm")
 
-  if "yy1_mode" in edits and edits["yy1_mode"] is not None:
-    comp.yy1_mode = max(0, min(4, int(float(edits["yy1_mode"]))))
-    changes.append(f"Mode=M{comp.yy1_mode}")
+  if any(k in edits for k in ("yy1_mode", "mode")) and (edits.get("yy1_mode") is not None or edits.get("mode") is not None):
+    raw_m = edits.get("yy1_mode") if edits.get("yy1_mode") is not None else edits.get("mode")
+    try:
+      m_digit = re.search(r'\d+', str(raw_m))
+      comp.yy1_mode = int(m_digit.group(0)) if m_digit else max(0, min(4, int(float(raw_m))))
+      changes.append(f"Mode=M{comp.yy1_mode}")
+    except (ValueError, TypeError):
+      pass
 
   if "skip" in edits and str(edits["skip"]).strip() in ("Yes", "No"):
     comp.skip = str(edits["skip"]).strip()
@@ -1949,10 +1953,15 @@ def apply_batch_component_edit(
     elif f_key == "value":
       comp.value = val_clean
     elif f_key in ("nozzle", "head"):
-      comp.nozzle = val_clean
+      if val_clean.lower() in ("alt", "alternate"):
+        comp.nozzle = "1" if (idx % 2 == 0) else "2"
+      else:
+        m_h = re.search(r'\d+', val_clean)
+        comp.nozzle = m_h.group(0) if m_h else val_clean
     elif f_key == "rot_delta":
       try:
         comp.rotation = wrap_neoden_angle(comp.rotation + float(val_clean))
+        comp.new_rotation = wrap_neoden_angle(comp.new_rotation + float(val_clean))
       except ValueError as exc:
         raise ValueError("Rotation offset must be a number in degrees (e.g. -90, 90, 180).") from exc
     elif f_key == "speed":
@@ -1970,16 +1979,18 @@ def apply_batch_component_edit(
         comp.place_height = float(val_clean)
       except ValueError as exc:
         raise ValueError("Place Height (mm) must be a valid number.") from exc
-    elif f_key == "mode":
-      try:
-        m = int(float(val_clean))
-        if m not in (0, 1, 2, 3, 4):
-          raise ValueError()
-        comp.yy1_mode = m
-      except ValueError as exc:
+    elif f_key in ("mode", "yy1_mode"):
+      m_digit = re.search(r'\d+', val_clean)
+      if m_digit:
+        m = int(m_digit.group(0))
+        if m in (0, 1, 2, 3, 4):
+          comp.yy1_mode = m
+        else:
+          raise ValueError("YY1 Mode must be 0, 1, 2, 3, or 4.")
+      else:
         raise ValueError(
             "YY1 Mode must be 0 (Null), 1 (Camera), 2 (Vacuum), 3 (Cam+Vac), or 4 (Big IC)."
-        ) from exc
+        )
     else:
       raise ValueError(f"Unknown field '{field_name}'.")
 
@@ -2050,11 +2061,13 @@ def auto_assign_feeders_by_part(
     comp.feeder_id = part_to_feeder[key]
     if alternate_heads:
       comp.nozzle = "1" if (idx % 2 == 0) else "2"
+    else:
+      comp.nozzle = "1"
 
   return (
       f"Auto-assigned {len(part_to_feeder)} unique part type(s) to Feeders"
       f" {start_num}..{min(99, next_feeder - 1)}"
-      + (" with Head 1/2 alternation." if alternate_heads else ".")
+      + (" with Head 1/2 alternation." if alternate_heads else " (all Head 1).")
   )
 
 
@@ -3215,7 +3228,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
       <a href="/help" target="_blank" rel="noopener" class="help-box" title="Opens a detailed guide in a new tab">
         &#128214; Help Guide
       </a>
-      <span class="badge">v7.4</span>
+      <span class="badge">v7.5</span>
     </div>
   </div>
 
@@ -3264,36 +3277,41 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
       <!-- Section 2 (Always Open): Feeder & Part-Group Setup (Primary YY1 Workflow) -->
       <fieldset style="border-color:#3b82f6;">
         <legend style="color:#1d4ed8;">2. Feeder Configuration by Part Group (Value + Footprint)</legend>
-        <div class="row" style="justify-content:space-between;background:#eff6ff;padding:5px 7px;border-radius:4px;border:1px solid #bfdbfe;">
+        <div class="row" style="justify-content:space-between;background:#eff6ff;padding:5px 7px;border-radius:4px;border:1px solid #bfdbfe;gap:6px;flex-wrap:wrap;">
           <div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap;">
             <label style="font-weight:700;color:#1e3a8a;">Auto-Feeders:</label>
-            <select id="autoFeederStart" style="width:148px;">
-              <option value="1" selected>Start #1 (Tape 1&ndash;52)</option>
-              <option value="53">Start #53 (Tray 53&ndash;80)</option>
-              <option value="81">Start #81 (Bulk 81&ndash;99)</option>
+            <select id="autoFeederStart" style="width:170px;font-size:11px;">
+              <option value="1" selected>Start #1 (YY1 Tape 1&ndash;52)</option>
+              <option value="53">Start #53 (YY1 Tray 53&ndash;80)</option>
+              <option value="81">Start #81 (YY1 Bulk 81&ndash;99)</option>
             </select>
-            <label style="font-size:11px;display:inline-flex;align-items:center;gap:3px;" title="Alternate Head 1 & Head 2">
+            <label style="font-size:11px;display:inline-flex;align-items:center;gap:3px;" title="Alternate Head 1 &amp; Head 2 across consecutive picks (uncheck for all Head 1)">
               <input type="checkbox" id="autoAltHeads" checked> Alt H1/H2
             </label>
           </div>
-          <button type="button" onclick="runAdvancedAction('auto_feeders')" style="background:#1d4ed8;color:#ffffff;border-color:#1e40af;">Auto-Assign</button>
+          <div style="display:flex;align-items:center;gap:4px;">
+            <button type="button" onclick="runAdvancedAction('auto_feeders')" style="background:#1d4ed8;color:#ffffff;border-color:#1e40af;font-weight:600;">Auto-Assign</button>
+            <button type="button" onclick="setAllMode(3)" title="Set all components to Mode 3 (Camera + Vacuum Check - Recommended safe mode for YY1)" style="background:#e0f2fe;color:#0369a1;border-color:#7dd3fc;font-size:11px;padding:3px 6px;">All M3 (Cam+Vac)</button>
+          </div>
         </div>
 
         <div class="group-table-wrap">
           <table class="group-table">
             <thead>
               <tr>
-                <th style="text-align:left;padding-left:6px;">Part (Val / Pkg)</th>
-                <th style="width:52px;">Feeder</th>
-                <th style="width:58px;">Head</th>
-                <th style="width:82px;">Rot Nudge</th>
-                <th style="width:48px;">Spd%</th>
-                <th style="width:46px;">Mode</th>
+                <th style="width:48px;">Feeder</th>
+                <th style="width:56px;">Head</th>
+                <th style="width:80px;text-align:left;padding-left:6px;">Value</th>
+                <th style="width:72px;text-align:left;padding-left:6px;">Footprint</th>
+                <th style="width:84px;text-align:left;padding-left:6px;">Parts (#)</th>
+                <th style="width:62px;">Rot</th>
+                <th style="width:46px;">Spd%</th>
+                <th style="width:78px;">Mode</th>
                 <th style="width:54px;">Place?</th>
               </tr>
             </thead>
             <tbody id="partGroupTableBody">
-              <tr><td colspan="7" style="padding:16px;color:#64748b;">Load a file above to configure feeders by part group.</td></tr>
+              <tr><td colspan="9" style="padding:16px;color:#64748b;">Load a file above to configure feeders by part group.</td></tr>
             </tbody>
           </table>
         </div>
@@ -3444,12 +3462,12 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
               <option value="feeder">Feeder / FeederNo</option>
               <option value="footprint">Footprint</option>
               <option value="value">Value / Comment</option>
-              <option value="nozzle">Nozzle / Head</option>
+              <option value="nozzle">Head (1, 2, Alt)</option>
               <option value="rot_delta">Rotation Offset (+deg)</option>
               <option value="speed">YY1 Mount Speed (%)</option>
               <option value="pick_height">YY1 Pick Height (mm)</option>
               <option value="place_height">YY1 Place Height (mm)</option>
-              <option value="mode">YY1 Vision Mode (0-4)</option>
+              <option value="mode">YY1 Vision Mode (3=Cam+Vac, 1=Cam, 4=Big IC, 0=Fast)</option>
             </select>
             <label for="batchValue" style="font-weight:600;">Val:</label>
             <input type="text" id="batchValue" placeholder="e.g. 14 or -90" style="width:85px;">
@@ -3566,23 +3584,24 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
             <tr>
               <th style="width:28px;">#</th>
               <th style="width:48px;">Name</th>
-              <th style="width:52px;">Feeder</th>
+              <th style="width:50px;">Feeder</th>
               <th style="width:48px;">Head</th>
-              <th style="width:86px;">Value</th>
+              <th style="width:84px;">Value</th>
               <th style="width:68px;">Footprint</th>
-              <th style="width:56px;">Orig X</th>
-              <th style="width:56px;">Orig Y</th>
-              <th style="width:64px;">New X</th>
-              <th style="width:64px;">New Y</th>
-              <th style="width:108px;">New Rot (&deg;)</th>
-              <th style="width:48px;">Spd%</th>
-              <th style="width:52px;">PickH</th>
-              <th style="width:50px;">Mode</th>
-              <th style="width:66px;">Skip</th>
+              <th style="width:54px;">Orig X</th>
+              <th style="width:54px;">Orig Y</th>
+              <th style="width:62px;">New X</th>
+              <th style="width:62px;">New Y</th>
+              <th style="width:72px;" title="Offset from Fiducial 1 (&Delta;X, &Delta;Y) mm">&Delta; Fid 1</th>
+              <th style="width:104px;">New Rot (&deg;)</th>
+              <th style="width:46px;">Spd%</th>
+              <th style="width:48px;">PickH</th>
+              <th style="width:62px;">Mode</th>
+              <th style="width:64px;">Skip</th>
             </tr>
           </thead>
           <tbody id="compTableBody">
-            <tr><td colspan="15" style="padding:28px;color:#64748b;">Browse a KiCad <code>.pos</code>, NeoDen YY1 <code>.csv</code>, or NeoDen 4 <code>.csv</code> file on the left to view &amp; edit components.</td></tr>
+            <tr><td colspan="16" style="padding:28px;color:#64748b;">Browse a KiCad <code>.pos</code>, NeoDen YY1 <code>.csv</code>, or NeoDen 4 <code>.csv</code> file on the left to view &amp; edit components.</td></tr>
           </tbody>
         </table>
       </div>
@@ -3591,7 +3610,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-console.log('NeoDen Tool v7.3 initialized');
+console.log('NeoDen Tool v7.5 initialized');
 let currentData = null;
 let selectedRowIndex = null;
 
@@ -3700,9 +3719,9 @@ function updateTargetFormatHelp() {
   if (!helpBox) return;
 
   if (targetFmt === 'neoden4') {
-    helpBox.innerHTML = '<strong>Target 1 &mdash; NeoDen 4 Job CSV:</strong> Full production file for the <em>NeoDen 4 machine</em>. Generates 4-nozzle configuration with <code>#Feeder</code>/<code>stack</code> tables, pcb clamp lines, and <code>mirror</code>/<code>mark</code> SMD1 coordinates.';
+    helpBox.innerHTML = '<strong>Target 1 &mdash; NeoDen 4 Job CSV:</strong> Full production file for the <em>NeoDen 4 machine</em>. Uses 4-nozzle configuration with <code>#Feeder</code>/<code>stack</code> tables (Feeders 1&ndash;19 Front, 20&ndash;38 Rear, 39&ndash;48 Tray), pcb clamp lines, and <code>mirror</code>/<code>mark</code> SMD1 coordinates.';
   } else if (targetFmt === 'neoden_yy1') {
-    helpBox.innerHTML = '<strong>Target 2 &mdash; NeoDen YY1 Working CSV:</strong> Full production file for the <em>NeoDen YY1 machine</em>. Defaults to <strong>1 Panel (Rows=1, Cols=1)</strong>, preserves exact KiCad values &amp; footprints, and lets you configure feeders by part group or inline.';
+    helpBox.innerHTML = '<strong>Target 2 &mdash; NeoDen YY1 Working CSV:</strong> Full production file for the <em>NeoDen YY1 machine</em>. Defaults to <strong>1 Panel (Rows=1, Cols=1)</strong>, preserves exact KiCad values &amp; footprints, defaults to <strong>Mode 3 (Camera + Vacuum detection)</strong>, and uses YY1 feeder zones (Tape 1&ndash;52, Tray 53&ndash;80, Bulk 81&ndash;99).';
   } else if (targetFmt === 'neoden_yy1_import') {
     helpBox.innerHTML = '<strong>Target 3 &mdash; NeoDen YY1 11-Col Import Template:</strong> Simplified 11-column SD-card import template (<code>Designator,Footprint,Mid/Ref/Pad X/Y,Layer,Rotation,Comment</code>) for loading raw CAD positions.';
   }
@@ -3746,6 +3765,34 @@ function updateSectionVisibility() {
       exportBtn.textContent = 'CONVERT & EXPORT INITIAL NEODEN 4 CSV';
     } else {
       exportBtn.textContent = 'START / EXPORT NEODEN 4 CSV';
+    }
+  }
+
+  const autoFeederSelect = document.getElementById('autoFeederStart');
+  if (autoFeederSelect) {
+    const curVal = autoFeederSelect.value;
+    if (isYY1Target) {
+      if (!autoFeederSelect.querySelector('option[value="53"]')) {
+        autoFeederSelect.innerHTML = `
+          <option value="1">Start #1 (YY1 Tape 1–52)</option>
+          <option value="53">Start #53 (YY1 Tray 53–80)</option>
+          <option value="81">Start #81 (YY1 Bulk 81–99)</option>
+        `;
+        if ([...autoFeederSelect.options].some(o => o.value === curVal)) {
+          autoFeederSelect.value = curVal;
+        }
+      }
+    } else {
+      if (!autoFeederSelect.querySelector('option[value="20"]')) {
+        autoFeederSelect.innerHTML = `
+          <option value="1">Start #1 (Front Feeders 1–19)</option>
+          <option value="20">Start #20 (Rear Feeders 20–38)</option>
+          <option value="39">Start #39 (IC Tray / Feeder 39–48)</option>
+        `;
+        if ([...autoFeederSelect.options].some(o => o.value === curVal)) {
+          autoFeederSelect.value = curVal;
+        }
+      }
     }
   }
 }
@@ -3979,7 +4026,7 @@ function renderPartGroups(groups) {
     badge.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'}`;
   }
   if (!groups || groups.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="color:#64748b;padding:12px;">No components loaded.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="color:#64748b;padding:12px;">No components loaded.</td></tr>';
     return;
   }
 
@@ -3989,41 +4036,60 @@ function renderPartGroups(groups) {
       ? g.designators.slice(0, 5).join(', ') + ` (+${g.designators.length - 5})`
       : g.designators.join(', ');
     const rowIndicesJson = JSON.stringify(g.row_indices);
+    const headRaw = String(g.head || g.yy1_head || g.nozzle || '1');
+    const headVal = headRaw.toLowerCase().includes('alt') ? 'Alt' : (headRaw.replace(/\\D/g, '') || '1');
+    const modeVal = (g.yy1_mode !== undefined && g.yy1_mode !== null) ? Number(g.yy1_mode) : 3;
 
     tr.innerHTML = `
       <td>
-        <input type="number" min="1" max="99" value="${g.feeder_id}"
+        <input type="number" min="1" max="99" value="${g.feeder_id}" style="width:42px;text-align:center;"
           title="Feeder # for ${escapeHtml(g.value)} (${escapeHtml(g.footprint)})"
           onchange='editGroupField(${rowIndicesJson}, {feeder_id: this.value})'>
       </td>
       <td>
-        <select onchange='editGroupField(${rowIndicesJson}, {head: this.value})'>
-          <option value="1" ${Number(g.head) === 1 ? 'selected' : ''}>H1</option>
-          <option value="2" ${Number(g.head) === 2 ? 'selected' : ''}>H2</option>
-          <option value="3" ${Number(g.head) === 3 ? 'selected' : ''}>H3</option>
-          <option value="4" ${Number(g.head) === 4 ? 'selected' : ''}>H4</option>
+        <select onchange='editGroupField(${rowIndicesJson}, {head: this.value})' style="font-size:11px;padding:2px 1px;width:52px;">
+          <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
+          <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
+          <option value="3" ${headVal === '3' ? 'selected' : ''}>H3</option>
+          <option value="4" ${headVal === '4' ? 'selected' : ''}>H4</option>
+          <option value="Alt" ${headVal === 'Alt' ? 'selected' : ''}>Alt</option>
         </select>
       </td>
       <td>
-        <input type="text" value="${escapeHtml(g.value)}"
+        <input type="text" value="${escapeHtml(g.value)}" style="width:76px;font-size:11px;padding:2px 3px;"
           title="Edit Value for all ${g.count} parts in this group (${escapeHtml(g.designators.join(', '))})"
           onchange='editGroupField(${rowIndicesJson}, {value: this.value})'>
       </td>
       <td>
-        <input type="text" value="${escapeHtml(g.footprint)}"
+        <input type="text" value="${escapeHtml(g.footprint)}" style="width:68px;font-size:11px;padding:2px 3px;"
           title="Edit Footprint for all ${g.count} parts in this group"
           onchange='editGroupField(${rowIndicesJson}, {footprint: this.value})'>
       </td>
-      <td class="pg-refs" title="${escapeHtml(g.designators.join(', '))}">
+      <td class="pg-refs" style="text-align:left;padding-left:6px;" title="${escapeHtml(g.designators.join(', '))}">
         <strong>${g.count}&times;</strong> ${escapeHtml(refsShort)}
       </td>
       <td>
-        <input type="number" min="1" max="100" value="${g.mount_speed || 50}" style="width:42px;"
+        <div style="display:inline-flex;gap:2px;">
+          <button type="button" class="rot-mini-btn" title="Rotate group -90°" onclick='nudgeGroupRot(${rowIndicesJson}, -90)'>-90</button>
+          <button type="button" class="rot-mini-btn" title="Rotate group +90°" onclick='nudgeGroupRot(${rowIndicesJson}, 90)'>+90</button>
+        </div>
+      </td>
+      <td>
+        <input type="number" min="1" max="100" value="${g.mount_speed || 50}" style="width:40px;text-align:center;font-size:11px;padding:2px 1px;"
           title="Mount speed (%)"
           onchange='editGroupField(${rowIndicesJson}, {mount_speed: this.value})'>
       </td>
       <td>
-        <select onchange='editGroupField(${rowIndicesJson}, {skip: this.value})'>
+        <select onchange='editGroupField(${rowIndicesJson}, {yy1_mode: this.value})' style="font-size:11px;padding:2px 1px;width:74px;">
+          <option value="3" ${modeVal === 3 ? 'selected' : ''} title="Mode 3: Camera + Vacuum (Recommended safe mode)">M3 (Cam+Vac)</option>
+          <option value="1" ${modeVal === 1 ? 'selected' : ''} title="Mode 1: Camera Only">M1 (Cam)</option>
+          <option value="4" ${modeVal === 4 ? 'selected' : ''} title="Mode 4: Big IC Enlarged FOV">M4 (Big IC)</option>
+          <option value="0" ${modeVal === 0 ? 'selected' : ''} title="Mode 0: Fast / Bypass Vision">M0 (Fast)</option>
+          <option value="2" ${modeVal === 2 ? 'selected' : ''} title="Mode 2: Vacuum Only">M2 (Vac)</option>
+        </select>
+      </td>
+      <td>
+        <select onchange='editGroupField(${rowIndicesJson}, {skip: this.value})' style="font-size:11px;padding:2px 1px;width:50px;">
           <option value="No" ${g.skip === 'No' ? 'selected' : ''}>Place</option>
           <option value="Yes" ${g.skip !== 'No' ? 'selected' : ''}>Skip</option>
         </select>
@@ -4031,6 +4097,35 @@ function renderPartGroups(groups) {
     `;
     tbody.appendChild(tr);
   });
+}
+
+function nudgeGroupRot(rowIndices, deltaDeg) {
+  editGroupField(rowIndices, {rot_delta: deltaDeg});
+}
+
+async function setAllMode(modeVal) {
+  if (!currentData) {
+    alert('Please load a file first.');
+    return;
+  }
+  const res = await fetch('/api/batch_modify', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      field: 'mode',
+      value: String(modeVal),
+      selector: 'all',
+      ...collectPreviewParams('custom')
+    })
+  });
+  const payload = await res.json();
+  if (payload.error) {
+    alert('Error setting mode: ' + payload.error);
+    return;
+  }
+  const fb = document.getElementById('advActionFeedback') || document.getElementById('batchFeedback');
+  if (fb) fb.textContent = `Set all components to Mode ${modeVal} (${modeVal === 3 ? 'Camera + Vacuum' : (modeVal === 1 ? 'Camera Only' : 'Custom')}).`;
+  applyLoadedState(payload, false);
 }
 
 async function editGroupField(rowIndices, edits) {
@@ -4357,7 +4452,9 @@ function renderTable(comps) {
     const skipDisplay = isYY1Target
       ? (c.skip === 'No' ? '0 (Place)' : '1 (Skip)')
       : c.skip;
-    const headVal = isYY1Target ? c.yy1_head : c.nozzle;
+    const rawHead = isYY1Target ? c.yy1_head : c.nozzle;
+    const headVal = String(rawHead || '1').replace(/\\D/g, '') || '1';
+    const modeVal = (c.yy1_mode !== undefined && c.yy1_mode !== null) ? Number(c.yy1_mode) : 3;
     const dx = c.new_x - fid1X;
     const dy = c.new_y - fid1Y;
 
@@ -4372,10 +4469,10 @@ function renderTable(comps) {
       </td>
       <td>
         <select class="inline-cell-select" onchange="editRowField(${idx}, {head: this.value})">
-          <option value="1" ${Number(headVal) === 1 ? 'selected' : ''}>H1</option>
-          <option value="2" ${Number(headVal) === 2 ? 'selected' : ''}>H2</option>
-          <option value="3" ${Number(headVal) === 3 ? 'selected' : ''}>H3</option>
-          <option value="4" ${Number(headVal) === 4 ? 'selected' : ''}>H4</option>
+          <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
+          <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
+          <option value="3" ${headVal === '3' ? 'selected' : ''}>H3</option>
+          <option value="4" ${headVal === '4' ? 'selected' : ''}>H4</option>
         </select>
       </td>
       <td>
@@ -4414,6 +4511,15 @@ function renderTable(comps) {
       <td>
         <input type="number" step="0.1" class="inline-cell-input inline-num" style="width:44px;" value="${fmtCoord(c.pick_height || 0, 2)}"
           title="Pick Height (mm)" onchange="editRowField(${idx}, {pick_height: this.value})">
+      </td>
+      <td>
+        <select class="inline-cell-select" onchange="editRowField(${idx}, {yy1_mode: this.value})" style="width:58px;font-size:10.5px;">
+          <option value="3" ${modeVal === 3 ? 'selected' : ''} title="Mode 3: Camera + Vacuum (Recommended)">M3</option>
+          <option value="1" ${modeVal === 1 ? 'selected' : ''} title="Mode 1: Camera Only">M1</option>
+          <option value="4" ${modeVal === 4 ? 'selected' : ''} title="Mode 4: Big IC">M4</option>
+          <option value="0" ${modeVal === 0 ? 'selected' : ''} title="Mode 0: Fast / Bypass">M0</option>
+          <option value="2" ${modeVal === 2 ? 'selected' : ''} title="Mode 2: Vacuum Only">M2</option>
+        </select>
       </td>
       <td>
         <span class="row-skip-pill ${skipClass}" onclick="toggleRowSkip(${idx})">${skipDisplay}</span>
