@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-NeoDen 4 & NeoDen YY1 Pick-and-Place CSV & KiCad .pos Converter Utility (v6.0)
+NeoDen 4 & NeoDen YY1 Pick-and-Place CSV & KiCad .pos Converter Utility (v7.5)
 ------------------------------------------------------------------------------
-What's New in v6.0:
+What's New in v7.5:
   - Full NeoDen YY1 Support (Import, Edit & Cross-Conversion):
       * Detects and parses NeoDen YY1 Working CSVs ('NEODEN,YY1,P&P FILE'),
         NeoDen YY1 11-column Import CSVs ('Mid X,Mid Y,Ref X,Ref Y,Pad X,Pad Y'),
@@ -38,7 +38,7 @@ import argparse
 import copy
 import csv
 from dataclasses import dataclass, field
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import io
 import json
 import math
@@ -239,7 +239,7 @@ class ComponentRow:
   mount_speed: int = 50       # Mount Speed (%) — YY1 default is 50-70%
   pick_height: float = 0.0    # Pick Height (mm) relative to Nozzle Height Datum
   place_height: float = 0.0   # Place Height (mm) relative to PCB surface
-  yy1_mode: int = 1           # Recognition mode: 0=Null, 1=Camera, 2=Vacuum, 3=Cam+Vac, 4=Big IC
+  yy1_mode: int = 3           # Recognition mode: 0=Null, 1=Camera, 2=Vacuum, 3=Cam+Vac (Default safe), 4=Big IC
   layer: str = "T"            # 'T' (Top) or 'B' (Bottom) for YY1 11-column import template
 
 
@@ -289,6 +289,10 @@ class NeoDenCSVAnalysis:
       default_factory=lambda: [YY1NozzleChange() for _ in range(4)]
   )
   has_negative_coords: bool = False
+  exclude_non_smd: bool = True
+  raw_source_bytes: bytes = field(default=b"", repr=False)
+  yy1_effective_fid_x: Optional[float] = None
+  yy1_effective_fid_y: Optional[float] = None
 
   edge_angles: Dict[str, float] = field(default_factory=dict)
   recommended_angle_deg: float = 0.0
@@ -326,10 +330,10 @@ def detect_csv_type_from_head(head_text: str) -> Optional[str]:
       or ("REF X" in clean_up and "PAD X" in clean_up and "DESIGNATOR" in clean_up)
   ):
     return "neoden_yy1_import"
-  if "#Feeder" in clean or clean.startswith("stack,") or "#SMD," in clean:
+  if "#FEEDER" in clean_up or clean_up.startswith("STACK,") or "#SMD," in clean_up:
     return "neoden"
-  if "Ref,Val,Package,PosX,PosY,Rot,Side" in clean or (
-      "PosX" in clean and "PosY" in clean and "Package" in clean
+  if "REF,VAL,PACKAGE,POSX,POSY,ROT,SIDE" in clean_up or (
+      "POSX" in clean_up and "POSY" in clean_up and "PACKAGE" in clean_up
   ):
     return "kicad_pos"
   return None
@@ -640,9 +644,12 @@ def convert_kicad_pos_text_to_neoden_lines(
   header_lines.append("test,No,")
   c1x, c1y = first_comp_xy if first_comp_xy else (0.0, 0.0)
   header_lines.append(
-      f"mirror_create,1,1,{c1x:.2f},{c1y:.2f},{c1x:.2f},{c1y:.2f},0,0,0,"
+      f"mirror_create,1,1,{format_yy1_float(c1x, 6)},{format_yy1_float(c1y, 6)},"
+      f"{format_yy1_float(c1x, 6)},{format_yy1_float(c1y, 6)},0,0,0,"
   )
-  header_lines.append(f"mirror,{c1x:.2f},{c1y:.2f},0,No,")
+  header_lines.append(
+      f"mirror,{format_yy1_float(c1x, 6)},{format_yy1_float(c1y, 6)},0,No,"
+  )
   header_lines.append(
       "#SMD,Feeder ID,Nozzle,Name,Value,Footprint,X,Y,Rotation,Skip"
   )
@@ -744,6 +751,17 @@ def clean_excel_corrupted_line(line: str, preserve_precision: bool = False) -> T
 
   return orig, False
 
+
+
+def _circular_mean_deg(angles: List[float]) -> float:
+  """Computes the circular mean of angles in degrees, safe across +/-180 deg."""
+  if not angles:
+    return 0.0
+  s = sum(math.sin(math.radians(a)) for a in angles)
+  c = sum(math.cos(math.radians(a)) for a in angles)
+  if math.isclose(s, 0.0, abs_tol=1e-12) and math.isclose(c, 0.0, abs_tol=1e-12):
+    return wrap_neoden_angle(angles[0])
+  return wrap_neoden_angle(math.degrees(math.atan2(s, c)))
 
 
 def analyze_fiducials(
@@ -848,32 +866,54 @@ def analyze_fiducials(
   cx = sum(f.x for f in fiducials) / n
   cy = sum(f.y for f in fiducials) / n
   corners: Dict[str, Fiducial] = {}
+  collision = False
   for f in fiducials:
     horiz = "R" if f.x >= cx else "L"
     vert = "T" if f.y >= cy else "B"
     label = f"{vert}{horiz}"
+    if label in corners:
+      collision = True
     f.corner_label = label
     corners[label] = f
+
+  if collision and n == 4:
+    # Fallback if an inset keying fiducial crosses the centroid:
+    # sort by Y into bottom pair and top pair, then by X within each pair.
+    by_y = sorted(fiducials, key=lambda f: (f.y, f.x))
+    bot_pair = sorted(by_y[:2], key=lambda f: f.x)
+    top_pair = sorted(by_y[2:], key=lambda f: f.x)
+    corners = {
+        "BL": bot_pair[0],
+        "BR": bot_pair[1],
+        "TL": top_pair[0],
+        "TR": top_pair[1],
+    }
+    for lbl, fid in corners.items():
+      fid.corner_label = lbl
 
   # Compute the tilt angle of each available perimeter edge relative to 0 deg
   if "BL" in corners and "BR" in corners:
     dx = corners["BR"].x - corners["BL"].x
     dy = corners["BR"].y - corners["BL"].y
-    edge_angles["Bottom Edge (BL->BR)"] = math.degrees(math.atan2(dy, dx))
+    edge_angles["Bottom Edge (BL->BR)"] = wrap_neoden_angle(
+        math.degrees(math.atan2(dy, dx))
+    )
   if "TL" in corners and "TR" in corners:
     dx = corners["TR"].x - corners["TL"].x
     dy = corners["TR"].y - corners["TL"].y
-    edge_angles["Top Edge (TL->TR)"] = math.degrees(math.atan2(dy, dx))
+    edge_angles["Top Edge (TL->TR)"] = wrap_neoden_angle(
+        math.degrees(math.atan2(dy, dx))
+    )
   if "BL" in corners and "TL" in corners:
     dx = corners["TL"].x - corners["BL"].x
     dy = corners["TL"].y - corners["BL"].y
-    edge_angles["Left Edge (BL->TL)"] = (
+    edge_angles["Left Edge (BL->TL)"] = wrap_neoden_angle(
         math.degrees(math.atan2(dy, dx)) - 90.0
     )
   if "BR" in corners and "TR" in corners:
     dx = corners["TR"].x - corners["BR"].x
     dy = corners["TR"].y - corners["BR"].y
-    edge_angles["Right Edge (BR->TR)"] = (
+    edge_angles["Right Edge (BR->TR)"] = wrap_neoden_angle(
         math.degrees(math.atan2(dy, dx)) - 90.0
     )
 
@@ -918,7 +958,7 @@ def analyze_fiducials(
       a_v = edge_angles[e_vert]
       a_h = edge_angles[e_horiz]
       ortho_err = abs(angle_diff_deg(a_v, a_h))
-      mean_angle = 0.5 * (a_v + a_h)
+      mean_angle = _circular_mean_deg([a_v, a_h])
       valid_pairs.append((
           ortho_err,
           mean_angle,
@@ -930,7 +970,11 @@ def analyze_fiducials(
       ))
 
   all_vals = list(edge_angles.values())
-  spread = max(all_vals) - min(all_vals)
+  spread = (
+      max(abs(angle_diff_deg(a, b)) for a in all_vals for b in all_vals)
+      if len(all_vals) > 1
+      else 0.0
+  )
 
   if valid_pairs:
     valid_pairs.sort(key=lambda item: item[0])
@@ -989,7 +1033,7 @@ def analyze_fiducials(
     f.used_for_rotation = True
     f.role_note = "Used (All-Edge Average)"
     used_indices.append(f.index)
-  avg_angle = sum(all_vals) / len(all_vals)
+  avg_angle = _circular_mean_deg(all_vals)
   return (
       edge_angles,
       avg_angle,
@@ -1000,18 +1044,41 @@ def analyze_fiducials(
 
 
 def update_fiducial_usage_for_mode(
-    analysis: NeoDenCSVAnalysis, rot_mode: str
+    analysis: NeoDenCSVAnalysis,
+    rot_mode: str,
+    cad_dx: Optional[float] = None,
+    cad_dy: Optional[float] = None,
 ) -> None:
   """
   Updates each fiducial's used_for_rotation flag and role_note for the active UI
   rotation mode so the user can visually confirm which marks are active.
   """
-  if rot_mode == "auto":
-    analyze_fiducials(analysis.fiducials)
-  elif rot_mode == "avg":
+  (
+      analysis.edge_angles,
+      rec_angle,
+      rec_method,
+      analysis.used_fiducial_indices,
+      analysis.outlier_fiducial_note,
+  ) = analyze_fiducials(analysis.fiducials, cad_dx=cad_dx, cad_dy=cad_dy)
+
+  if analysis.source_format == "kicad_pos" and rot_mode == "auto":
+    analysis.recommended_angle_deg = 0.0
+    analysis.recommended_method = "KiCad .pos Import (Raw CAD Coordinates)"
+  else:
+    analysis.recommended_angle_deg = rec_angle
+    analysis.recommended_method = rec_method
+
+  if rot_mode == "avg":
     for f in analysis.fiducials:
       f.used_for_rotation = True
       f.role_note = "Used (All-Edge Average)"
+    if analysis.edge_angles:
+      analysis.recommended_angle_deg = _circular_mean_deg(
+          list(analysis.edge_angles.values())
+      )
+      analysis.recommended_method = (
+          f"Average of {len(analysis.edge_angles)} Fiducial Edges"
+      )
   elif rot_mode in ("sq45", "rect2"):
     for idx, f in enumerate(analysis.fiducials):
       if idx < 2:
@@ -1048,6 +1115,8 @@ def _populate_yy1_Into_neoden_analysis(
   is_11col_import = (analysis.source_format == "neoden_yy1_import")
   comp_lines_n4: List[str] = []
   first_comp_xy: Optional[Tuple[float, float]] = None
+  part_group_feeders: Dict[Tuple[str, str], str] = {}
+  next_auto_feeder = 1
 
   for raw_line in lines:
     stripped = raw_line.strip()
@@ -1080,6 +1149,8 @@ def _populate_yy1_Into_neoden_analysis(
           analysis.yy1_fid_y = float(tokens[4] or 0.0)
           analysis.yy1_offset_x = float(tokens[6] or 0.0)
           analysis.yy1_offset_y = float(tokens[8] or 0.0)
+          if analysis.yy1_fid_x < 0.0 or analysis.yy1_fid_y < 0.0:
+            analysis.has_negative_coords = True
           if abs(analysis.yy1_fid_x) > 1e-6 or abs(analysis.yy1_fid_y) > 1e-6:
             analysis.fiducials.append(
                 Fiducial(
@@ -1123,6 +1194,8 @@ def _populate_yy1_Into_neoden_analysis(
         fp = sanitize_csv_token(tokens[1])
         val = sanitize_csv_token(tokens[10])
         layer = (tokens[8] or "T").strip().upper()
+        if not des:
+          continue
         try:
           cx = float(re.sub(r"[a-zA-Z]+$", "", tokens[2]) or 0.0)
           cy = float(re.sub(r"[a-zA-Z]+$", "", tokens[3]) or 0.0)
@@ -1131,15 +1204,22 @@ def _populate_yy1_Into_neoden_analysis(
           )
         except ValueError:
           continue
-        feeder_id, nozzle, _v, norm_fp, _roff, _sk = assign_feeder_for_kicad_part(
+        _, nozzle, v_norm, norm_fp, _roff, _sk = assign_feeder_for_kicad_part(
             des, val, fp
         )
+        fp = norm_fp or fp
+        val = v_norm or val
+        grp_key = (val.upper(), fp.upper())
+        if grp_key not in part_group_feeders:
+          part_group_feeders[grp_key] = str(min(99, next_auto_feeder))
+          next_auto_feeder += 1
+        feeder_id = part_group_feeders[grp_key]
         head_str, _ = clamp_yy1_head(nozzle)
         skip_n4 = "No"
         speed = 50
         pick_h = 0.0
         place_h = 0.0
-        mode_val = default_yy1_vision_mode(fp or norm_fp, des)
+        mode_val = default_yy1_vision_mode(fp, des)
       elif len(tokens) >= 13:
         # 13-col YY1 Working File format (like DACdestroyers.csv):
         # Designator,Comment,Footprint,Mid X,Mid Y,Rotation,Head,FeederNo,Mount Speed (%),Pick Height(mm),Place Height(mm),Mode,Skip
@@ -1170,10 +1250,14 @@ def _populate_yy1_Into_neoden_analysis(
           place_h = float(tokens[10] or 0.0)
         except ValueError:
           place_h = 0.0
-        try:
-          mode_val = max(0, min(4, int(float(tokens[11] or 1))))
-        except ValueError:
-          mode_val = 1
+        raw_mode = tokens[11].strip() if len(tokens) > 11 else ""
+        if raw_mode != "":
+          try:
+            mode_val = max(0, min(4, int(float(raw_mode))))
+          except ValueError:
+            mode_val = default_yy1_vision_mode(fp, des)
+        else:
+          mode_val = default_yy1_vision_mode(fp, des)
         # YY1 Skip column: '0' means Place (Skip='No' in NeoDen 4), '1' means Skip (Skip='Yes' in NeoDen 4)
         raw_skip = (tokens[12] or "0").strip().upper()
         skip_n4 = "Yes" if raw_skip in ("1", "YES", "TRUE") else "No"
@@ -1187,9 +1271,8 @@ def _populate_yy1_Into_neoden_analysis(
       if first_comp_xy is None:
         first_comp_xy = (cx, cy)
 
-      line_idx_n4 = len(DEFAULT_NEODEN_STACK_LINES) + 7 + len(comp_lines_n4)
       comp_row = ComponentRow(
-          line_idx=line_idx_n4,
+          line_idx=0,
           feeder_id=feeder_id,
           nozzle=head_str,
           name=des,
@@ -1228,26 +1311,34 @@ def _populate_yy1_Into_neoden_analysis(
   header_lines.append("markext,1,0.8,3,1,0,")
   header_lines.append("test,No,")
   c1x, c1y = first_comp_xy if first_comp_xy else (0.0, 0.0)
+  mc_idx = len(header_lines)
   header_lines.append(
       f"mirror_create,{analysis.yy1_columns},{analysis.yy1_rows},"
       f"{c1x:.2f},{c1y:.2f},{c1x:.2f},{c1y:.2f},0,0,0,"
   )
   p1_line_idx = len(header_lines)
   header_lines.append(f"mirror,{c1x:.2f},{c1y:.2f},0,No,")
-  p2_line_idx = len(header_lines)
-  header_lines.append(f"mirror,{c1x:.2f},{c1y:.2f},0,No,")
+  panels: List[PanelMirror] = [
+      PanelMirror(index=1, line_idx=p1_line_idx, x=c1x, y=c1y, rotation=0.0, skip="No")
+  ]
+  if analysis.yy1_columns * analysis.yy1_rows > 1:
+    p2_line_idx = len(header_lines)
+    header_lines.append(f"mirror,{c1x:.2f},{c1y:.2f},0,No,")
+    panels.append(
+        PanelMirror(index=2, line_idx=p2_line_idx, x=c1x, y=c1y, rotation=0.0, skip="No")
+    )
   header_lines.append(
       "#SMD,Feeder ID,Nozzle,Name,Value,Footprint,X,Y,Rotation,Skip"
   )
 
+  for idx_c, comp_row in enumerate(analysis.components):
+    comp_row.line_idx = len(header_lines) + idx_c
+
   analysis.raw_lines = header_lines + comp_lines_n4
-  analysis.mirror_create_line_idx = p1_line_idx - 1
+  analysis.mirror_create_line_idx = mc_idx
   analysis.mirror_cols = analysis.yy1_columns
   analysis.mirror_rows = analysis.yy1_rows
-  analysis.panels = [
-      PanelMirror(index=1, line_idx=p1_line_idx, x=c1x, y=c1y, rotation=0.0, skip="No"),
-      PanelMirror(index=2, line_idx=p2_line_idx, x=c1x, y=c1y, rotation=0.0, skip="No"),
-  ]
+  analysis.panels = panels
   analysis.feeder_ids = sorted(
       {c.feeder_id for c in analysis.components},
       key=lambda x: int(x) if x.isdigit() else 999,
@@ -1275,6 +1366,7 @@ def parse_neoden_csv_bytes(
         " files are under 5 MB."
     )
 
+  orig_raw_bytes = raw_bytes
   had_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
   if had_bom:
     raw_bytes = raw_bytes[3:]
@@ -1294,6 +1386,8 @@ def parse_neoden_csv_bytes(
       line_ending=line_ending,
       cad_fiducials=cad_fids,
       excluded_parts=excluded_parts,
+      exclude_non_smd=exclude_non_smd,
+      raw_source_bytes=orig_raw_bytes,
   )
 
   # Route NeoDen YY1 files through the dedicated YY1 parser
@@ -1357,6 +1451,8 @@ def parse_neoden_csv_bytes(
         try:
           fx = float(coord_tokens[fid_i])
           fy = float(coord_tokens[fid_i + 1])
+          if fx < 0.0 or fy < 0.0:
+            analysis.has_negative_coords = True
           analysis.fiducials.append(
               Fiducial(index=(fid_i // 2) + 1, x=fx, y=fy)
           )
@@ -1437,11 +1533,11 @@ def parse_neoden_csv_bytes(
   # Estimate board bounding box dimensions for YY1 PanelizedPCB header using both
   # components and fiducials, and seed YY1 Fiducial 1 from the bottom-left fiducial.
   if analysis.components or analysis.fiducials:
-    all_pts_x = [abs(c.x) for c in analysis.components] + [
-        abs(f.x) for f in analysis.fiducials
+    all_pts_x = [c.x for c in analysis.components] + [
+        f.x for f in analysis.fiducials
     ]
-    all_pts_y = [abs(c.y) for c in analysis.components] + [
-        abs(f.y) for f in analysis.fiducials
+    all_pts_y = [c.y for c in analysis.components] + [
+        f.y for f in analysis.fiducials
     ]
     min_x, max_x = min(all_pts_x), max(all_pts_x)
     min_y, max_y = min(all_pts_y), max(all_pts_y)
@@ -1717,9 +1813,10 @@ def apply_part_group_edit(
 
   if "rot_delta" in edits and edits["rot_delta"] is not None:
     delta = float(edits["rot_delta"])
+    raw_delta = -delta if analysis.invert_rot_sign else delta
     for idx in target_indices:
       c = analysis.components[idx]
-      c.rotation = wrap_neoden_angle(c.rotation + delta)
+      c.rotation = wrap_neoden_angle(c.rotation + raw_delta)
       c.new_rotation = wrap_neoden_angle(c.new_rotation + delta)
     changes_desc.append(f"Rot {delta:+.0f}°")
 
@@ -1809,6 +1906,8 @@ def apply_single_row_edit(
     dx = target_nx - comp.new_x
     comp.x = round(comp.x + dx, 6)
     comp.new_x = round(target_nx, 6)
+    if row_idx == 0 and analysis.panels:
+      analysis.panels[0].x = round(analysis.panels[0].x + dx, 6)
     changes.append(f"X={comp.new_x:g}")
 
   y_val = edits.get("new_y", edits.get("y"))
@@ -1817,19 +1916,23 @@ def apply_single_row_edit(
     dy = target_ny - comp.new_y
     comp.y = round(comp.y + dy, 6)
     comp.new_y = round(target_ny, 6)
+    if row_idx == 0 and analysis.panels:
+      analysis.panels[0].y = round(analysis.panels[0].y + dy, 6)
     changes.append(f"Y={comp.new_y:g}")
 
   rot_val = edits.get("new_rot", edits.get("rot"))
   if rot_val is not None:
     target_nrot = wrap_neoden_angle(float(rot_val))
-    drot = target_nrot - comp.new_rotation
-    comp.rotation = wrap_neoden_angle(comp.rotation + drot)
+    drot = angle_diff_deg(target_nrot, comp.new_rotation)
+    raw_drot = -drot if analysis.invert_rot_sign else drot
+    comp.rotation = wrap_neoden_angle(comp.rotation + raw_drot)
     comp.new_rotation = target_nrot
     changes.append(f"Rot={comp.new_rotation:g}°")
 
   if "rot_delta" in edits and edits["rot_delta"] is not None:
     drot = float(edits["rot_delta"])
-    comp.rotation = wrap_neoden_angle(comp.rotation + drot)
+    raw_drot = -drot if analysis.invert_rot_sign else drot
+    comp.rotation = wrap_neoden_angle(comp.rotation + raw_drot)
     comp.new_rotation = wrap_neoden_angle(comp.new_rotation + drot)
     changes.append(f"Rot {drot:+.0f}°")
 
@@ -1960,8 +2063,10 @@ def apply_batch_component_edit(
         comp.nozzle = m_h.group(0) if m_h else val_clean
     elif f_key == "rot_delta":
       try:
-        comp.rotation = wrap_neoden_angle(comp.rotation + float(val_clean))
-        comp.new_rotation = wrap_neoden_angle(comp.new_rotation + float(val_clean))
+        drot = float(val_clean)
+        raw_drot = -drot if analysis.invert_rot_sign else drot
+        comp.rotation = wrap_neoden_angle(comp.rotation + raw_drot)
+        comp.new_rotation = wrap_neoden_angle(comp.new_rotation + drot)
       except ValueError as exc:
         raise ValueError("Rotation offset must be a number in degrees (e.g. -90, 90, 180).") from exc
     elif f_key == "speed":
@@ -2090,6 +2195,16 @@ def sort_components_order(
   Preserves original line_idx slot positions so NeoDen 4 raw_lines stay aligned.
   """
   line_indices = [c.line_idx for c in analysis.components]
+  old_p1_off_x = (
+      (analysis.panels[0].x - analysis.components[0].x)
+      if (analysis.components and analysis.panels)
+      else 0.0
+  )
+  old_p1_off_y = (
+      (analysis.panels[0].y - analysis.components[0].y)
+      if (analysis.components and analysis.panels)
+      else 0.0
+  )
   mode = (sort_by or "feeder").strip().lower()
   if mode == "feeder":
     analysis.components.sort(
@@ -2115,6 +2230,9 @@ def sort_components_order(
 
   for comp, l_idx in zip(analysis.components, line_indices):
     comp.line_idx = l_idx
+  if analysis.components and analysis.panels:
+    analysis.panels[0].x = round(analysis.components[0].x + old_p1_off_x, 6)
+    analysis.panels[0].y = round(analysis.components[0].y + old_p1_off_y, 6)
   return f"Sorted {len(analysis.components)} components by {label}."
 
 
@@ -2131,6 +2249,14 @@ def mirror_bottom_side_x(
   for comp in analysis.components:
     comp.x = round(board_width_x - comp.x, 6)
     comp.rotation = wrap_neoden_angle(180.0 - comp.rotation)
+  for f in analysis.fiducials:
+    f.x = round(board_width_x - f.x, 6)
+  for p in analysis.panels:
+    p.x = round(board_width_x - p.x, 6)
+  if abs(analysis.yy1_fid_x) > 1e-6 or analysis.fiducials:
+    analysis.yy1_fid_x = round(board_width_x - analysis.yy1_fid_x, 6)
+  if analysis.components and analysis.panels:
+    analysis.panels[0].x = analysis.components[0].x
   return (
       f"Mirrored X coordinates across {board_width_x:.2f} mm board width for"
       f" bottom-side mounting ({len(analysis.components)} components)."
@@ -2337,6 +2463,9 @@ def apply_transformation(
       else:
         comp.new_rotation = wrap_neoden_angle(base_r + rot_off)
 
+  eff_fid_x = yy1_fid_x if yy1_fid_x is not None else analysis.yy1_fid_x
+  eff_fid_y = yy1_fid_y if yy1_fid_y is not None else analysis.yy1_fid_y
+
   # Apply optional YY1 coordinate-sign normalization:
   if yy1_coord_mode == "invert_neg_y":
     for comp in analysis.components:
@@ -2344,15 +2473,30 @@ def apply_transformation(
         comp.new_y = -comp.new_y
       if comp.new_x < 0.0:
         comp.new_x = -comp.new_x
+    if eff_fid_y < 0.0:
+      eff_fid_y = -eff_fid_y
+    if eff_fid_x < 0.0:
+      eff_fid_x = -eff_fid_x
   elif yy1_coord_mode == "shift_positive":
-    min_x = min(c.new_x for c in analysis.components)
-    min_y = min(c.new_y for c in analysis.components)
+    pts_x = [c.new_x for c in analysis.components]
+    pts_y = [c.new_y for c in analysis.components]
+    if analysis.fiducials or abs(eff_fid_x) > 1e-6 or abs(eff_fid_y) > 1e-6:
+      pts_x.append(eff_fid_x)
+      pts_y.append(eff_fid_y)
+    min_x = min(pts_x)
+    min_y = min(pts_y)
     shift_x = (5.0 - min_x) if min_x < 0.0 else 0.0
     shift_y = (5.0 - min_y) if min_y < 0.0 else 0.0
     if shift_x != 0.0 or shift_y != 0.0:
       for comp in analysis.components:
         comp.new_x += shift_x
         comp.new_y += shift_y
+      if analysis.fiducials or abs(eff_fid_x) > 1e-6 or abs(eff_fid_y) > 1e-6:
+        eff_fid_x += shift_x
+        eff_fid_y += shift_y
+
+  analysis.yy1_effective_fid_x = round(eff_fid_x, 6)
+  analysis.yy1_effective_fid_y = round(eff_fid_y, 6)
 
   # If the user selected NeoDen YY1 output, format and return the YY1 lines
   if target_format == "neoden_yy1":
@@ -2362,8 +2506,8 @@ def apply_transformation(
         unit_width=yy1_unit_width,
         rows=yy1_rows,
         columns=yy1_columns,
-        fid_x=yy1_fid_x,
-        fid_y=yy1_fid_y,
+        fid_x=eff_fid_x,
+        fid_y=eff_fid_y,
         offset_x=yy1_offset_x,
         offset_y=yy1_offset_y,
     )
@@ -2441,7 +2585,7 @@ HELP_PAGE_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Help &amp; Workflow Guide — NeoDen 4 CSV Utility v5.0</title>
+<title>Help &amp; Workflow Guide — NeoDen YY1 &amp; NeoDen 4 CSV Utility v7.5</title>
 <style>
   :root { color-scheme: light; }
   * {
@@ -2539,7 +2683,7 @@ HELP_PAGE_HTML = """<!DOCTYPE html>
 <body>
 <div class="container">
   <div class="header">
-    <h1>NeoDen 4 &amp; NeoDen YY1 CSV &amp; KiCad .pos Utility (v6.0) — Help &amp; User Guide</h1>
+    <h1>NeoDen 4 &amp; NeoDen YY1 CSV &amp; KiCad .pos Utility (v7.5) — Help &amp; User Guide</h1>
     <p>Complete reference for KiCad / NeoDen 4 / NeoDen YY1 conversion, fiducial rotation math, manual SMD1 tweaking, YY1 edge-case protections, and batch component editing.</p>
   </div>
   <div class="body">
@@ -2547,11 +2691,11 @@ HELP_PAGE_HTML = """<!DOCTYPE html>
     <div class="step-card">
       <h3>Workflow A: Convert KiCad <code>.pos</code> or NeoDen 4 CSV &rarr; NeoDen YY1 CSV</h3>
       <ul>
-        <li>Click <strong>Choose File / Browse</strong> in Section 1 and select a KiCad <code>.pos</code> CSV, a NeoDen 4 Job CSV, or an existing NeoDen YY1 CSV.</li>
-        <li>In Section 1, set <strong>Output Machine / Format</strong> to <strong>NeoDen YY1 Working File (<code>NEODEN,YY1,P&P FILE</code>)</strong> (or the 11-column YY1 SD-card Import Template).</li>
-        <li>Configure <strong>NeoDen YY1 Settings</strong> (UnitLength, UnitWidth, Rows, Columns, Fiducial 1-X/1-Y, OverallOffsetX/Y, and Coordinate Sign Mode).</li>
-        <li>If your KiCad file has negative Y coordinates (top-left page origin), choose <strong>Invert Negative Y (<code>-Y &rarr; +Y</code>)</strong> or <strong>Shift Bounding Box Positive</strong> so the YY1 machine never rejects negative coordinates.</li>
-        <li>Use <strong>Section 4 (Batch Modify)</strong> to adjust Feeder numbers (1&ndash;52 Tape, 53&ndash;80 Flexible/Stick/Tray, 81&ndash;99 Bulk), Head (1&ndash;2), Mount Speed (%), Pick/Place Height (mm), or Vision Mode (0&ndash;4), then click <strong>EXPORT NEODEN YY1 CSV</strong>.</li>
+        <li>Click <strong>Browse File</strong> in Section 1 and select a KiCad <code>.pos</code> CSV, a NeoDen 4 Job CSV, or an existing NeoDen YY1 CSV. Toggle <strong>Auto-exclude connectors / headers / switches / THT</strong> if you want to include SMD headers (such as <code>J*</code>).</li>
+        <li>In Section 1, set <strong>Export Target</strong> to <strong>NeoDen YY1 Working CSV (<code>NEODEN,YY1,P&amp;P FILE</code>)</strong> (or the 11-column YY1 SD-card Import Template).</li>
+        <li>Use <strong>Section 2 (Part-Group Table)</strong> or the <strong>Batch Edit</strong> dropdown to adjust Feeder numbers (1&ndash;52 Tape, 53&ndash;80 Stick/Tray, 81&ndash;99 Bulk), Head (1&ndash;2), Mount Speed (%), or Vision Mode (0&ndash;4; default Mode 3 Cam+Vac).</li>
+        <li>Expand <strong>YY1 Board Size, Panelization &amp; Fiducial 1-X/Y</strong> if you need to adjust UnitLength, UnitWidth, Rows/Cols, Fiducial 1, or Coordinate Sign Handling (<strong>Invert Negative Coords</strong> or <strong>Shift Bounding Box Positive</strong>).</li>
+        <li>Click <strong>CONVERT &amp; EXPORT NEODEN YY1 CSV</strong> to download a Windows CRLF ASCII file.</li>
       </ul>
     </div>
     <div class="step-card">
@@ -2617,24 +2761,24 @@ HELP_PAGE_HTML = """<!DOCTYPE html>
       </thead>
       <tbody>
         <tr>
-          <td><strong>1. Input File &amp; Output Format</strong></td>
-          <td>Browse a KiCad <code>.pos</code>, NeoDen 4 <code>.csv</code>, or NeoDen YY1 <code>.csv</code>, and select whether to export for <strong>NeoDen 4</strong>, <strong>NeoDen YY1 Working File</strong>, or <strong>NeoDen YY1 11-Col Import File</strong>.</td>
+          <td><strong>1. Input File, Export Target &amp; Quick Rotation / Skips</strong></td>
+          <td>Browse a KiCad <code>.pos</code>, NeoDen 4 <code>.csv</code>, or NeoDen YY1 <code>.csv</code>, toggle KiCad non-SMD auto-exclusion, pick the export machine target, apply global tape rotation offsets, or toggle global skips.</td>
         </tr>
         <tr>
-          <td><strong>NeoDen YY1 Settings</strong></td>
-          <td>Configure <code>PanelizedPCB</code> (UnitLength, UnitWidth, Rows, Columns), <code>Fiducial</code> (1-X, 1-Y, OverallOffsetX, OverallOffsetY), and Coordinate Sign Handling (Preserve, Invert Negative Y, or Shift Positive).</td>
+          <td><strong>2. Feeder Configuration by Part Group</strong></td>
+          <td>Configure Feeder #, Head (1&ndash;2 for YY1, 1&ndash;4 for NeoDen 4, or Alt), Value, Footprint, Rotation, Speed %, Vision Mode (default Mode 3 Cam+Vac), and Place/Skip across all matching parts at once.</td>
         </tr>
         <tr>
-          <td><strong>2. Manual Panel 1 / SMD1 &amp; Panel 2 Tweaking</strong></td>
-          <td>Sets physical machine coordinates of the 1st component (<code>SMD1</code>) with <code>-0.1</code> / <code>+0.1</code> mm nudge buttons and resets bogus <code>mirror_create</code> angles.</td>
+          <td><strong>Dropdown A: YY1 Board Size, Panelization &amp; Fiducial 1-X/Y</strong></td>
+          <td>Configure <code>PanelizedPCB</code> (UnitLength, UnitWidth, Rows, Columns; default 1&times;1), <code>Fiducial</code> (1-X, 1-Y), and Coordinate Sign Handling (Preserve, Invert Negative, or Shift Positive).</td>
         </tr>
         <tr>
-          <td><strong>3. Fiducial Rotation &amp; Global Skip Toggles</strong></td>
-          <td>Displays active vs. excluded fiducials, computes board tilt using orthogonal corner / outlier rejection, and provides one-click global Skip toggles.</td>
+          <td><strong>Dropdown B: FR1 Origin Shift, SMD1 &amp; Fiducial Tilt</strong></td>
+          <td>Re-zero coordinates to Fiducial 1, SMD1, Bounding-Box Margin, or custom &Delta;X/&Delta;Y; tweak physical <code>Panel 1 / SMD1</code> &amp; <code>Panel 2</code> with 0.1 mm nudges; and inspect/override orthogonal fiducial tilt.</td>
         </tr>
         <tr>
-          <td><strong>4. Batch Modify Components (Undo/Redo)</strong></td>
-          <td>Batch-update <code>Feeder</code>, <code>Footprint</code>, <code>Nozzle / Head</code>, <code>Mount Speed (%)</code>, <code>Pick Height</code>, <code>Place Height</code>, or <code>YY1 Vision Mode (0-4)</code> using row selectors like <code>1-12, 15</code> or <code>all</code>.</td>
+          <td><strong>Dropdown C &amp; D: Batch Edit, Sort, Mirror &amp; Nozzle Change</strong></td>
+          <td>Batch-modify row ranges (<code>1-12, 15</code> or <code>all</code>), sort placement order, mirror X for bottom-side boards, and configure YY1 <code>NozzleChange</code> Slots 1&ndash;4 and <code>OverallOffsetX/Y</code>.</td>
         </tr>
       </tbody>
     </table>
@@ -2646,7 +2790,7 @@ HELP_PAGE_HTML = """<!DOCTYPE html>
 
 
 # ---------------------------------------------------------------------------
-# Main Rufus-Style 2-Column Web GUI HTML (v5.0)
+# Main Rufus-Style 2-Column Web GUI HTML (v7.5)
 # ---------------------------------------------------------------------------
 
 RUFUS_WEB_HTML = """<!DOCTYPE html>
@@ -2654,7 +2798,7 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NeoDen YY1 &amp; NeoDen 4 CSV &amp; KiCad .pos Utility v7.0</title>
+<title>NeoDen YY1 &amp; NeoDen 4 CSV &amp; KiCad .pos Utility v7.5</title>
 <style>
   :root {
     color-scheme: light;
@@ -3170,6 +3314,87 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
     color: #1d4ed8 !important;
     font-weight: 600;
   }
+  .inline-cell-input {
+    width: 100%;
+    min-width: 38px;
+    padding: 2px 3px !important;
+    font-size: 11px !important;
+    text-align: center;
+    border: 1px solid transparent !important;
+    background: transparent !important;
+    border-radius: 3px;
+    color: #0f172a;
+  }
+  .inline-cell-input:hover, .inline-cell-input:focus {
+    border-color: #3b82f6 !important;
+    background: #ffffff !important;
+    outline: none;
+  }
+  .inline-cell-select {
+    font-size: 11px !important;
+    padding: 2px 2px !important;
+    border: 1px solid #cbd5e1 !important;
+    background: #ffffff !important;
+    border-radius: 3px;
+    color: #0f172a;
+  }
+  .inline-num {
+    width: 44px !important;
+    text-align: center;
+  }
+  .inline-txt {
+    min-width: 64px;
+    text-align: left;
+  }
+  .inline-coord {
+    width: 60px !important;
+    text-align: right;
+    font-weight: 600;
+    color: #1d4ed8;
+    border: 1px solid #cbd5e1 !important;
+    background: #ffffff !important;
+  }
+  .inline-rot {
+    width: 48px !important;
+    text-align: right;
+    font-weight: 600;
+    border: 1px solid #cbd5e1 !important;
+    background: #ffffff !important;
+  }
+  .highlight-new {
+    background: #f0f9ff;
+  }
+  .rot-cell-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+  }
+  .rot-mini-btn {
+    padding: 1px 4px;
+    font-size: 10px;
+    line-height: 1.2;
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    border-radius: 3px;
+  }
+  .pg-refs {
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10.5px;
+    color: #334155;
+  }
+  .btn-outline {
+    background: #ffffff;
+    color: #1e3a8a;
+    border: 1px solid #93c5fd;
+    border-radius: 3px;
+    cursor: pointer;
+  }
+  .btn-outline:hover {
+    background: #eff6ff;
+  }
   .row-skip-pill {
     display: inline-block;
     padding: 2px 6px;
@@ -3243,12 +3468,19 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
           <input type="file" id="fileInput" accept=".csv,.pos,text/csv" style="font-size:11.5px;flex:1;">
           <span id="sourceFormatTag" class="format-tag">No File</span>
         </div>
+        <div class="row" id="kicadFilterRow" style="margin-top:2px;">
+          <label style="display:inline-flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;" title="When checked, automatically excludes connectors (J*), pin headers, switches (SW*), test points (TP*), battery holders, and THT DIP packages when importing a KiCad .pos file. Uncheck to include all top-side parts (such as SMD headers like J1).">
+            <input type="checkbox" id="excludeNonSmd" checked onchange="toggleExcludeNonSmd()">
+            <span>Auto-exclude connectors / headers / switches / THT on KiCad <code>.pos</code></span>
+          </label>
+          <span id="excludedCountBadge" class="sub-badge" style="display:none;">0 excluded</span>
+        </div>
         <div class="row">
           <label for="targetFormat" style="font-weight:600;width:95px;">Export Target:</label>
           <select id="targetFormat" onchange="onTargetFormatChange()" style="flex:1;font-weight:600;">
             <option value="neoden_yy1" selected>NeoDen YY1 Working CSV (NEODEN,YY1,P&amp;P FILE &mdash; Default)</option>
             <option value="neoden4">NeoDen 4 Job CSV (#Feeder / stack / comp)</option>
-            <option value="neoden_yy1_import" id="optTarget3" style="display:none;" disabled>NeoDen YY1 11-Col Bare Import Template</option>
+            <option value="neoden_yy1_import" id="optTarget3">NeoDen YY1 11-Col Bare Import Template</option>
           </select>
         </div>
 
@@ -3268,9 +3500,9 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
         <!-- Global Skip Toggles -->
         <div class="row" style="margin-top:4px;">
           <label style="width:95px;font-weight:700;color:#0f172a;">Global Skips:</label>
-          <button type="button" class="skip-btn active-no" onclick="setSkipMode('all_no')">Place All (Skip=0)</button>
-          <button type="button" class="skip-btn active-yes" onclick="setSkipMode('all_yes')">Skip All (Skip=1)</button>
-          <button type="button" class="skip-btn" onclick="setSkipMode('first_no')">1st Part Only</button>
+          <button type="button" id="skipBtnAllNo" class="skip-btn active-no" onclick="setSkipMode('all_no')">Place All (Skip=0)</button>
+          <button type="button" id="skipBtnAllYes" class="skip-btn" onclick="setSkipMode('all_yes')">Skip All (Skip=1)</button>
+          <button type="button" id="skipBtnFirstNo" class="skip-btn" onclick="setSkipMode('first_no')">1st Part Only</button>
         </div>
       </fieldset>
 
@@ -3520,6 +3752,22 @@ RUFUS_WEB_HTML = """<!DOCTYPE html>
               <label>Drop:</label><input type="text" id="ncDrp1" value="Station1" style="width:62px;" onchange="recalculate()">
               <label>Pick:</label><input type="text" id="ncPck1" value="Station1" style="width:62px;" onchange="recalculate()">
             </div>
+            <div class="row">
+              <span style="width:42px;font-weight:700;">Slot 3:</span>
+              <select id="ncEn2" style="width:56px;" onchange="recalculate()"><option value="OFF">OFF</option><option value="ON">ON</option></select>
+              <label>Before#:</label><input type="number" id="ncBef2" value="1" min="1" style="width:46px;" onchange="recalculate()">
+              <select id="ncHd2" style="width:66px;" onchange="recalculate()"><option value="Head1">Head1</option><option value="Head2">Head2</option></select>
+              <label>Drop:</label><input type="text" id="ncDrp2" value="Station1" style="width:62px;" onchange="recalculate()">
+              <label>Pick:</label><input type="text" id="ncPck2" value="Station1" style="width:62px;" onchange="recalculate()">
+            </div>
+            <div class="row">
+              <span style="width:42px;font-weight:700;">Slot 4:</span>
+              <select id="ncEn3" style="width:56px;" onchange="recalculate()"><option value="OFF">OFF</option><option value="ON">ON</option></select>
+              <label>Before#:</label><input type="number" id="ncBef3" value="1" min="1" style="width:46px;" onchange="recalculate()">
+              <select id="ncHd3" style="width:66px;" onchange="recalculate()"><option value="Head1">Head1</option><option value="Head2">Head2</option></select>
+              <label>Drop:</label><input type="text" id="ncDrp3" value="Station1" style="width:62px;" onchange="recalculate()">
+              <label>Pick:</label><input type="text" id="ncPck3" value="Station1" style="width:62px;" onchange="recalculate()">
+            </div>
           </div>
           <div class="row" style="margin-top:8px;padding-top:6px;border-top:1px dashed #cbd5e1;">
             <button type="button" onclick="exportTarget3Directly()" style="width:100%;background:#f1f5f9;">
@@ -3661,7 +3909,9 @@ async function handleFileSelected(file) {
   try {
     const buf = await file.arrayBuffer();
     console.log('Read arrayBuffer, uploading to /api/upload...');
-    const res = await fetch('/api/upload?filename=' + encodeURIComponent(file.name), {
+    const exclChk = document.getElementById('excludeNonSmd');
+    const exclParam = (exclChk && !exclChk.checked) ? '0' : '1';
+    const res = await fetch('/api/upload?filename=' + encodeURIComponent(file.name) + '&exclude_non_smd=' + exclParam, {
       method: 'POST',
       body: buf
     });
@@ -3713,52 +3963,48 @@ if (fileInputEl) {
   });
 }
 
-function updateTargetFormatHelp() {
-  const targetFmt = document.getElementById('targetFormat').value;
-  const helpBox = document.getElementById('targetFormatHelp');
-  if (!helpBox) return;
-
-  if (targetFmt === 'neoden4') {
-    helpBox.innerHTML = '<strong>Target 1 &mdash; NeoDen 4 Job CSV:</strong> Full production file for the <em>NeoDen 4 machine</em>. Uses 4-nozzle configuration with <code>#Feeder</code>/<code>stack</code> tables (Feeders 1&ndash;19 Front, 20&ndash;38 Rear, 39&ndash;48 Tray), pcb clamp lines, and <code>mirror</code>/<code>mark</code> SMD1 coordinates.';
-  } else if (targetFmt === 'neoden_yy1') {
-    helpBox.innerHTML = '<strong>Target 2 &mdash; NeoDen YY1 Working CSV:</strong> Full production file for the <em>NeoDen YY1 machine</em>. Defaults to <strong>1 Panel (Rows=1, Cols=1)</strong>, preserves exact KiCad values &amp; footprints, defaults to <strong>Mode 3 (Camera + Vacuum detection)</strong>, and uses YY1 feeder zones (Tape 1&ndash;52, Tray 53&ndash;80, Bulk 81&ndash;99).';
-  } else if (targetFmt === 'neoden_yy1_import') {
-    helpBox.innerHTML = '<strong>Target 3 &mdash; NeoDen YY1 11-Col Import Template:</strong> Simplified 11-column SD-card import template (<code>Designator,Footprint,Mid/Ref/Pad X/Y,Layer,Rotation,Comment</code>) for loading raw CAD positions.';
-  }
-}
-
 function onTargetFormatChange() {
-  updateTargetFormatHelp();
   updateSectionVisibility();
   if (currentData) {
     recalculate('custom');
   }
 }
 
+async function toggleExcludeNonSmd() {
+  if (!currentData || currentData.source_format !== 'kicad_pos') return;
+  const excl = Boolean(document.getElementById('excludeNonSmd')?.checked);
+  const res = await fetch('/api/reparse_kicad', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      exclude_non_smd: excl,
+      ...collectPreviewParams('custom')
+    })
+  });
+  const payload = await res.json();
+  if (payload.error) {
+    alert('Re-parse Error: ' + payload.error);
+    return;
+  }
+  selectedRowIndex = null;
+  applyLoadedState(payload, true);
+}
+
 function updateSectionVisibility() {
-  updateTargetFormatHelp();
   const targetFmt = document.getElementById('targetFormat').value;
   const isYY1Target = (targetFmt === 'neoden_yy1' || targetFmt === 'neoden_yy1_import');
   const isKicad = currentData ? (currentData.source_format === 'kicad_pos') : false;
 
-  const settingsBox = document.getElementById('neodenSettingsContainer');
-  const stage1Card = document.getElementById('kicadStage1Card');
   const exportBtn = document.getElementById('exportBtn');
-  const detailsAlign = document.getElementById('detailsAlignment');
+  const ddOriginAlign = document.getElementById('ddOriginAlign');
 
-  if (settingsBox && currentData) {
-    settingsBox.style.display = 'flex';
-  }
-  if (stage1Card) {
-    stage1Card.style.display = (isKicad && !isYY1Target) ? 'block' : 'none';
-  }
-  if (detailsAlign && !isYY1Target && currentData) {
-    detailsAlign.open = !isKicad;
+  if (ddOriginAlign && !isYY1Target && currentData) {
+    ddOriginAlign.open = !isKicad;
   }
 
   if (exportBtn) {
     if (targetFmt === 'neoden_yy1') {
-      exportBtn.textContent = 'CONVERT & EXPORT NEODEN YY1 CSV (1 PANEL)';
+      exportBtn.textContent = 'CONVERT & EXPORT NEODEN YY1 CSV';
     } else if (targetFmt === 'neoden_yy1_import') {
       exportBtn.textContent = 'EXPORT NEODEN YY1 11-COL IMPORT CSV';
     } else if (isKicad) {
@@ -3860,17 +4106,11 @@ function pickFiducialFromDropdown() {
   }
 }
 
-async function applyOriginShift(mode) {
+async function applyOriginShift(modeArg) {
   if (!currentData) return;
-  let targetX = 0.0;
-  let targetY = 0.0;
-  if (mode === 'fid1') {
-    targetX = parseFloat(document.getElementById('yy1FidX').value) || 0.0;
-    targetY = parseFloat(document.getElementById('yy1FidY').value) || 0.0;
-  } else {
-    targetX = parseFloat(document.getElementById('originTargetX').value) || 0.0;
-    targetY = parseFloat(document.getElementById('originTargetY').value) || 0.0;
-  }
+  const mode = modeArg || document.getElementById('originShiftMode').value || 'fid1';
+  const targetX = parseFloat(document.getElementById('originTargetX').value) || 0.0;
+  const targetY = parseFloat(document.getElementById('originTargetY').value) || 0.0;
   const res = await fetch('/api/shift_origin', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -3885,15 +4125,6 @@ async function applyOriginShift(mode) {
   if (payload.error) {
     alert('Shift Origin Error: ' + payload.error);
     return;
-  }
-  // Sync Fid 1 inputs with updated state
-  document.getElementById('yy1FidX').value = fmtCoord(payload.yy1_fid_x, 4);
-  document.getElementById('yy1FidY').value = fmtCoord(payload.yy1_fid_y, 4);
-  document.getElementById('p1x').value = fmtCoord(payload.p1_x, 4);
-  document.getElementById('p1y').value = fmtCoord(payload.p1_y, 4);
-  if (payload.has_p2) {
-    document.getElementById('p2x').value = fmtCoord(payload.p2_x, 4);
-    document.getElementById('p2y').value = fmtCoord(payload.p2_y, 4);
   }
   applyLoadedState(payload, false);
 }
@@ -3915,40 +4146,71 @@ function applyLoadedState(payload, resetInputs) {
     } else {
       document.getElementById('targetFormat').value = 'neoden_yy1';
     }
-
-    document.getElementById('yy1UnitLen').value = fmtCoord(payload.yy1_unit_length || 20.0, 2);
-    document.getElementById('yy1UnitWid').value = fmtCoord(payload.yy1_unit_width || 28.5, 2);
-    document.getElementById('yy1Rows').value = payload.yy1_rows || 1;
-    document.getElementById('yy1Cols').value = payload.yy1_columns || 1;
-    document.getElementById('yy1FidX').value = fmtCoord(payload.yy1_fid_x || 0.0, 4);
-    document.getElementById('yy1FidY').value = fmtCoord(payload.yy1_fid_y || 0.0, 4);
-    document.getElementById('yy1OffX').value = fmtCoord(payload.yy1_offset_x || 0.0, 2);
-    document.getElementById('yy1OffY').value = fmtCoord(payload.yy1_offset_y || 0.0, 2);
     document.getElementById('yy1CoordMode').value = 'preserve';
-    document.getElementById('yy1RotOffset').value = fmtCoord(payload.yy1_rot_offset || 0.0, 2);
-    document.getElementById('invertRotSign').checked = Boolean(payload.invert_rot_sign);
-    updateActiveRotButtons(payload.yy1_rot_offset || 0.0);
-
-    document.getElementById('p1x').value = fmtCoord(payload.p1_x, 4);
-    document.getElementById('p1y').value = fmtCoord(payload.p1_y, 4);
-    if (payload.has_p2) {
-      document.getElementById('p2x').disabled = false;
-      document.getElementById('p2y').disabled = false;
-      document.getElementById('p2x').value = fmtCoord(payload.p2_x, 4);
-      document.getElementById('p2y').value = fmtCoord(payload.p2_y, 4);
-    } else {
-      document.getElementById('p2x').value = '';
-      document.getElementById('p2y').value = '';
-      document.getElementById('p2x').disabled = true;
-      document.getElementById('p2y').disabled = true;
-    }
     document.getElementById('rotMode').value = 'auto';
-    document.getElementById('boardAngle').value = payload.recommended_angle.toFixed(4);
-    updateBoardAngleLock();
-  } else {
-    const curRotOff = parseFloat(document.getElementById('yy1RotOffset').value) || 0.0;
-    updateActiveRotButtons(curRotOff);
   }
+
+  document.getElementById('yy1UnitLen').value = fmtCoord(payload.yy1_unit_length || 20.0, 2);
+  document.getElementById('yy1UnitWid').value = fmtCoord(payload.yy1_unit_width || 28.5, 2);
+  document.getElementById('yy1Rows').value = payload.yy1_rows || 1;
+  document.getElementById('yy1Cols').value = payload.yy1_columns || 1;
+  document.getElementById('yy1FidX').value = fmtCoord(payload.yy1_fid_x || 0.0, 4);
+  document.getElementById('yy1FidY').value = fmtCoord(payload.yy1_fid_y || 0.0, 4);
+  document.getElementById('yy1OffX').value = fmtCoord(payload.yy1_offset_x || 0.0, 2);
+  document.getElementById('yy1OffY').value = fmtCoord(payload.yy1_offset_y || 0.0, 2);
+  document.getElementById('yy1RotOffset').value = fmtCoord(payload.yy1_rot_offset || 0.0, 2);
+  document.getElementById('invertRotSign').checked = Boolean(payload.invert_rot_sign);
+  updateActiveRotButtons(payload.yy1_rot_offset || 0.0);
+
+  const exclChk = document.getElementById('excludeNonSmd');
+  if (exclChk && payload.exclude_non_smd !== undefined) {
+    exclChk.checked = Boolean(payload.exclude_non_smd);
+  }
+  const exclBadge = document.getElementById('excludedCountBadge');
+  if (exclBadge) {
+    if (payload.source_format === 'kicad_pos') {
+      const exList = payload.excluded_parts || [];
+      exclBadge.style.display = 'inline-block';
+      exclBadge.textContent = `${exList.length} excluded`;
+      exclBadge.title = exList.length ? exList.join('\\n') : 'No parts excluded';
+    } else {
+      exclBadge.style.display = 'none';
+    }
+  }
+
+  document.getElementById('p1x').value = fmtCoord(payload.p1_x, 4);
+  document.getElementById('p1y').value = fmtCoord(payload.p1_y, 4);
+  if (payload.has_p2) {
+    document.getElementById('p2x').disabled = false;
+    document.getElementById('p2y').disabled = false;
+    document.getElementById('p2x').value = fmtCoord(payload.p2_x, 4);
+    document.getElementById('p2y').value = fmtCoord(payload.p2_y, 4);
+  } else {
+    document.getElementById('p2x').value = '';
+    document.getElementById('p2y').value = '';
+    document.getElementById('p2x').disabled = true;
+    document.getElementById('p2y').disabled = true;
+  }
+
+  const ncList = payload.yy1_nozzle_changes || [];
+  [0, 1, 2, 3].forEach(i => {
+    const nc = ncList[i] || {};
+    const enEl = document.getElementById('ncEn' + i);
+    const befEl = document.getElementById('ncBef' + i);
+    const hdEl = document.getElementById('ncHd' + i);
+    const drpEl = document.getElementById('ncDrp' + i);
+    const pckEl = document.getElementById('ncPck' + i);
+    if (enEl) enEl.value = (nc.enabled || 'OFF').toUpperCase();
+    if (befEl) befEl.value = nc.before_component || 1;
+    if (hdEl) hdEl.value = nc.head || 'Head1';
+    if (drpEl) drpEl.value = nc.drop_station || 'Station1';
+    if (pckEl) pckEl.value = nc.pickup_station || 'Station1';
+  });
+
+  if (document.getElementById('rotMode').value !== 'manual') {
+    document.getElementById('boardAngle').value = Number(payload.active_angle || 0).toFixed(4);
+  }
+  updateBoardAngleLock();
 
   updateSectionVisibility();
   populateFiducialQuickPick(
@@ -4008,9 +4270,22 @@ function applyLoadedState(payload, resetInputs) {
   const noCount = (payload.components || []).filter(c => c.skip === 'No').length;
   const yesCount = (payload.components || []).length - noCount;
   const targetFmt = document.getElementById('targetFormat').value;
-  const skipHint = (targetFmt === 'neoden_yy1')
+  const isYY1Skip = (targetFmt === 'neoden_yy1');
+  const skipHint = isYY1Skip
     ? 'YY1 Skip: 0=Place, 1=Skip'
     : 'NeoDen 4 Skip: No=Place, Yes=Skip';
+  const btnAllNo = document.getElementById('skipBtnAllNo');
+  const btnAllYes = document.getElementById('skipBtnAllYes');
+  const btnFirstNo = document.getElementById('skipBtnFirstNo');
+  if (btnAllNo && btnAllYes && btnFirstNo) {
+    btnAllNo.textContent = isYY1Skip ? 'Place All (Skip=0)' : 'Place All (Skip=No)';
+    btnAllYes.textContent = isYY1Skip ? 'Skip All (Skip=1)' : 'Skip All (Skip=Yes)';
+    const totalC = (payload.components || []).length;
+    btnAllNo.classList.toggle('active-no', totalC > 0 && noCount === totalC);
+    btnAllYes.classList.toggle('active-yes', totalC > 0 && yesCount === totalC);
+    const isFirstOnly = totalC > 1 && noCount === 1 && payload.components[0].skip === 'No';
+    btnFirstNo.classList.toggle('active-no', isFirstOnly);
+  }
   document.getElementById('tableSubHeader').textContent =
     `${payload.components.length} components (Place=${noCount}, Skip=${yesCount}) — ${skipHint}`;
   document.getElementById('statusBar').textContent =
@@ -4019,16 +4294,15 @@ function applyLoadedState(payload, resetInputs) {
 
 function renderPartGroups(groups) {
   const tbody = document.getElementById('partGroupTableBody');
-  const badge = document.getElementById('partGroupCountBadge');
   if (!tbody) return;
   tbody.innerHTML = '';
-  if (badge) {
-    badge.textContent = `${groups.length} group${groups.length === 1 ? '' : 's'}`;
-  }
   if (!groups || groups.length === 0) {
     tbody.innerHTML = '<tr><td colspan="9" style="color:#64748b;padding:12px;">No components loaded.</td></tr>';
     return;
   }
+
+  const targetFmt = document.getElementById('targetFormat').value;
+  const isYY1Target = (targetFmt === 'neoden_yy1' || targetFmt === 'neoden_yy1_import');
 
   groups.forEach((g, gIdx) => {
     const tr = document.createElement('tr');
@@ -4036,23 +4310,35 @@ function renderPartGroups(groups) {
       ? g.designators.slice(0, 5).join(', ') + ` (+${g.designators.length - 5})`
       : g.designators.join(', ');
     const rowIndicesJson = JSON.stringify(g.row_indices);
-    const headRaw = String(g.head || g.yy1_head || g.nozzle || '1');
+    const headRaw = String(isYY1Target ? (g.yy1_head || g.head || '1') : (g.nozzle || g.head || '1'));
     const headVal = headRaw.toLowerCase().includes('alt') ? 'Alt' : (headRaw.replace(/\\D/g, '') || '1');
     const modeVal = (g.yy1_mode !== undefined && g.yy1_mode !== null) ? Number(g.yy1_mode) : 3;
-
-    tr.innerHTML = `
-      <td>
-        <input type="number" min="1" max="99" value="${g.feeder_id}" style="width:42px;text-align:center;"
-          title="Feeder # for ${escapeHtml(g.value)} (${escapeHtml(g.footprint)})"
-          onchange='editGroupField(${rowIndicesJson}, {feeder_id: this.value})'>
-      </td>
-      <td>
-        <select onchange='editGroupField(${rowIndicesJson}, {head: this.value})' style="font-size:11px;padding:2px 1px;width:52px;">
+    const isMixedFeeder = (g.feeder_id === 'Mixed');
+    const headOptionsHtml = isYY1Target
+      ? `
+          <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
+          <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
+          <option value="Alt" ${headVal === 'Alt' ? 'selected' : ''}>Alt</option>
+        `
+      : `
           <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
           <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
           <option value="3" ${headVal === '3' ? 'selected' : ''}>H3</option>
           <option value="4" ${headVal === '4' ? 'selected' : ''}>H4</option>
           <option value="Alt" ${headVal === 'Alt' ? 'selected' : ''}>Alt</option>
+        `;
+
+    tr.innerHTML = `
+      <td>
+        <input type="number" class="inline-cell-input inline-num" min="1" max="99"
+          value="${isMixedFeeder ? '' : escapeHtml(g.feeder_id)}" placeholder="${isMixedFeeder ? 'Mix' : ''}"
+          style="width:42px;text-align:center;"
+          title="Feeder # for ${escapeHtml(g.value)} (${escapeHtml(g.footprint)})"
+          onchange='editGroupField(${rowIndicesJson}, {feeder_id: this.value})'>
+      </td>
+      <td>
+        <select class="inline-cell-select" onchange='editGroupField(${rowIndicesJson}, {head: this.value})' style="font-size:11px;padding:2px 1px;width:52px;">
+          ${headOptionsHtml}
         </select>
       </td>
       <td>
@@ -4123,7 +4409,7 @@ async function setAllMode(modeVal) {
     alert('Error setting mode: ' + payload.error);
     return;
   }
-  const fb = document.getElementById('advActionFeedback') || document.getElementById('batchFeedback');
+  const fb = document.getElementById('batchFeedback');
   if (fb) fb.textContent = `Set all components to Mode ${modeVal} (${modeVal === 3 ? 'Camera + Vacuum' : (modeVal === 1 ? 'Camera Only' : 'Custom')}).`;
   applyLoadedState(payload, false);
 }
@@ -4169,11 +4455,7 @@ async function editRowField(rowIndex, edits) {
 
 function nudgeRowRot(rowIndex, deltaDeg) {
   if (!currentData || !currentData.components[rowIndex]) return;
-  const comp = currentData.components[rowIndex];
-  let nextRot = (comp.new_rot || 0.0) + deltaDeg;
-  while (nextRot > 180.0) nextRot -= 360.0;
-  while (nextRot <= -180.0) nextRot += 360.0;
-  editRowField(rowIndex, {rot: nextRot});
+  editRowField(rowIndex, {rot_delta: deltaDeg});
 }
 
 function rotateSelectedRow(deltaDeg) {
@@ -4214,8 +4496,12 @@ function updateSelectedHud() {
     return;
   }
   const c = currentData.components[selectedRowIndex];
-  const fidX = parseFloat(document.getElementById('yy1FidX').value) || 0.0;
-  const fidY = parseFloat(document.getElementById('yy1FidY').value) || 0.0;
+  const fidX = (currentData.yy1_effective_fid_x !== null && currentData.yy1_effective_fid_x !== undefined)
+    ? currentData.yy1_effective_fid_x
+    : (parseFloat(document.getElementById('yy1FidX').value) || 0.0);
+  const fidY = (currentData.yy1_effective_fid_y !== null && currentData.yy1_effective_fid_y !== undefined)
+    ? currentData.yy1_effective_fid_y
+    : (parseFloat(document.getElementById('yy1FidY').value) || 0.0);
   const dx = c.new_x - fidX;
   const dy = c.new_y - fidY;
 
@@ -4254,8 +4540,12 @@ function renderBoardMap(payload) {
 
   const uLen = parseFloat(document.getElementById('yy1UnitLen').value) || payload.yy1_unit_length || 20.0;
   const uWid = parseFloat(document.getElementById('yy1UnitWid').value) || payload.yy1_unit_width || 28.5;
-  const fid1X = parseFloat(document.getElementById('yy1FidX').value) || 0.0;
-  const fid1Y = parseFloat(document.getElementById('yy1FidY').value) || 0.0;
+  const fid1X = (payload.yy1_effective_fid_x !== null && payload.yy1_effective_fid_x !== undefined)
+    ? payload.yy1_effective_fid_x
+    : (parseFloat(document.getElementById('yy1FidX').value) || 0.0);
+  const fid1Y = (payload.yy1_effective_fid_y !== null && payload.yy1_effective_fid_y !== undefined)
+    ? payload.yy1_effective_fid_y
+    : (parseFloat(document.getElementById('yy1FidY').value) || 0.0);
 
   let minX = Math.min(0, fid1X);
   let maxX = Math.max(uLen, fid1X);
@@ -4436,8 +4726,12 @@ function renderTable(comps) {
   tbody.innerHTML = '';
   const targetFmt = document.getElementById('targetFormat').value;
   const isYY1Target = (targetFmt === 'neoden_yy1' || targetFmt === 'neoden_yy1_import');
-  const fid1X = parseFloat(document.getElementById('yy1FidX').value) || 0.0;
-  const fid1Y = parseFloat(document.getElementById('yy1FidY').value) || 0.0;
+  const fid1X = (currentData && currentData.yy1_effective_fid_x !== null && currentData.yy1_effective_fid_x !== undefined)
+    ? currentData.yy1_effective_fid_x
+    : (parseFloat(document.getElementById('yy1FidX').value) || 0.0);
+  const fid1Y = (currentData && currentData.yy1_effective_fid_y !== null && currentData.yy1_effective_fid_y !== undefined)
+    ? currentData.yy1_effective_fid_y
+    : (parseFloat(document.getElementById('yy1FidY').value) || 0.0);
 
   comps.forEach((c, idx) => {
     const tr = document.createElement('tr');
@@ -4457,6 +4751,17 @@ function renderTable(comps) {
     const modeVal = (c.yy1_mode !== undefined && c.yy1_mode !== null) ? Number(c.yy1_mode) : 3;
     const dx = c.new_x - fid1X;
     const dy = c.new_y - fid1Y;
+    const rowHeadOpts = isYY1Target
+      ? `
+          <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
+          <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
+        `
+      : `
+          <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
+          <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
+          <option value="3" ${headVal === '3' ? 'selected' : ''}>H3</option>
+          <option value="4" ${headVal === '4' ? 'selected' : ''}>H4</option>
+        `;
 
     tr.innerHTML = `
       <td>${idx + 1}</td>
@@ -4469,10 +4774,7 @@ function renderTable(comps) {
       </td>
       <td>
         <select class="inline-cell-select" onchange="editRowField(${idx}, {head: this.value})">
-          <option value="1" ${headVal === '1' ? 'selected' : ''}>H1</option>
-          <option value="2" ${headVal === '2' ? 'selected' : ''}>H2</option>
-          <option value="3" ${headVal === '3' ? 'selected' : ''}>H3</option>
-          <option value="4" ${headVal === '4' ? 'selected' : ''}>H4</option>
+          ${rowHeadOpts}
         </select>
       </td>
       <td>
@@ -4550,7 +4852,10 @@ function onModeChange() {
   } else if (mode === 'avg') {
     const vals = Object.values(currentData.edge_angles || {});
     if (vals.length > 0) {
-      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      let sumS = 0, sumC = 0;
+      vals.forEach(v => { sumS += Math.sin(v * Math.PI / 180); sumC += Math.cos(v * Math.PI / 180); });
+      let avg = Math.atan2(sumS, sumC) * 180 / Math.PI;
+      if (Math.abs(avg + 180) < 1e-6) avg = 180;
       document.getElementById('boardAngle').value = avg.toFixed(4);
     }
   } else if (mode === 'sq45' && currentData.fiducials.length >= 2) {
@@ -4558,7 +4863,7 @@ function onModeChange() {
     const dx = f2.x - f1.x, dy = f2.y - f1.y;
     const nom = Math.atan2(dy >= 0 ? 1 : -1, dx >= 0 ? 1 : -1) * 180 / Math.PI;
     const raw = Math.atan2(dy, dx) * 180 / Math.PI;
-    let diff = ((raw - nom + 180) % 360) - 180;
+    let diff = ((raw - nom + 540) % 360) - 180;
     document.getElementById('boardAngle').value = diff.toFixed(4);
   } else if (mode === 'rect2' && currentData.fiducials.length >= 2) {
     const cdx = parseFloat(document.getElementById('cadDx').value);
@@ -4568,7 +4873,7 @@ function onModeChange() {
       const dx = f2.x - f1.x, dy = f2.y - f1.y;
       const nom = Math.atan2(dy >= 0 ? Math.abs(cdy) : -Math.abs(cdy), dx >= 0 ? Math.abs(cdx) : -Math.abs(cdx)) * 180 / Math.PI;
       const raw = Math.atan2(dy, dx) * 180 / Math.PI;
-      let diff = ((raw - nom + 180) % 360) - 180;
+      let diff = ((raw - nom + 540) % 360) - 180;
       document.getElementById('boardAngle').value = diff.toFixed(4);
     }
   }
@@ -4642,32 +4947,6 @@ async function redoEdit() {
   applyLoadedState(payload, false);
 }
 
-function switchTab(tabName) {
-  const isAdv = (tabName === 'adv');
-  const mainPane = document.getElementById('mainTabPane');
-  const advPane = document.getElementById('advTabPane');
-  const tabMain = document.getElementById('tabBtnMain');
-  const tabAdv = document.getElementById('tabBtnAdv');
-  if (mainPane) mainPane.style.display = isAdv ? 'none' : 'flex';
-  if (advPane) advPane.style.display = isAdv ? 'flex' : 'none';
-  if (tabMain) tabMain.classList.toggle('active', !isAdv);
-  if (tabAdv) tabAdv.classList.toggle('active', isAdv);
-}
-
-function toggleTarget3Unlock() {
-  const chk = document.getElementById('unlockTarget3');
-  const unlocked = chk ? chk.checked : true;
-  const opt3 = document.getElementById('optTarget3');
-  if (!opt3) return;
-  opt3.style.display = unlocked ? '' : 'none';
-  opt3.disabled = !unlocked;
-  const sel = document.getElementById('targetFormat');
-  if (!unlocked && sel && sel.value === 'neoden_yy1_import') {
-    sel.value = 'neoden_yy1';
-    onTargetFormatChange();
-  }
-}
-
 async function exportTarget3Directly() {
   if (!currentData) {
     alert('Please browse and select a file in Main Controls first.');
@@ -4694,7 +4973,7 @@ async function exportTarget3Directly() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  const fb = document.getElementById('advActionFeedback') || document.getElementById('batchFeedback');
+  const fb = document.getElementById('batchFeedback');
   if (fb) fb.textContent = `Exported Target 3 (YY1 11-Col Import): ${data.download_name}`;
 }
 
@@ -4717,7 +4996,7 @@ async function runAdvancedAction(actionType, param = '') {
     body: JSON.stringify(bodyObj)
   });
   const payload = await res.json();
-  const fb = document.getElementById('advActionFeedback') || document.getElementById('batchFeedback');
+  const fb = document.getElementById('batchFeedback');
   if (payload.error) {
     if (fb) fb.textContent = 'Error: ' + payload.error;
     return;
@@ -4729,13 +5008,15 @@ async function runAdvancedAction(actionType, param = '') {
 function collectPreviewParams(skipMode = 'custom') {
   const targetFmt = document.getElementById('targetFormat').value;
   const isKicadStage1N4 = currentData && currentData.source_format === 'kicad_pos' && targetFmt === 'neoden4';
-  const nozzleChanges = [0, 1].map(i => ({
+  const nozzleChanges = [0, 1, 2, 3].map(i => ({
     enabled: document.getElementById('ncEn' + i) ? document.getElementById('ncEn' + i).value : 'OFF',
     before_component: document.getElementById('ncBef' + i) ? (parseInt(document.getElementById('ncBef' + i).value, 10) || 1) : 1,
     head: document.getElementById('ncHd' + i) ? document.getElementById('ncHd' + i).value : 'Head1',
     drop_station: document.getElementById('ncDrp' + i) ? document.getElementById('ncDrp' + i).value : 'Station1',
     pickup_station: document.getElementById('ncPck' + i) ? document.getElementById('ncPck' + i).value : 'Station1'
   }));
+  const rawCadDx = parseFloat(document.getElementById('cadDx')?.value);
+  const rawCadDy = parseFloat(document.getElementById('cadDy')?.value);
   return {
     target_format: targetFmt,
     yy1_coord_mode: document.getElementById('yy1CoordMode').value,
@@ -4751,6 +5032,8 @@ function collectPreviewParams(skipMode = 'custom') {
     invert_rot_sign: document.getElementById('invertRotSign').checked,
     yy1_nozzle_changes: nozzleChanges,
     rot_mode: document.getElementById('rotMode').value,
+    cad_dx: isNaN(rawCadDx) ? null : rawCadDx,
+    cad_dy: isNaN(rawCadDy) ? null : rawCadDy,
     board_angle: isKicadStage1N4 ? 0.0 : (parseFloat(document.getElementById('boardAngle').value) || 0.0),
     p1_x: isKicadStage1N4 ? null : (parseFloat(document.getElementById('p1x').value) || 0.0),
     p1_y: isKicadStage1N4 ? null : (parseFloat(document.getElementById('p1y').value) || 0.0),
@@ -4803,8 +5086,21 @@ async function exportCSV() {
       : `Downloaded ${data.download_name} (CRLF + exact NeoDen commas)`;
 }
 
-// Initialize target format explanatory card on page load
-updateTargetFormatHelp();
+// Load initial state (if launched with a CLI file or after page refresh)
+async function fetchInitialState() {
+  updateSectionVisibility();
+  try {
+    const res = await fetch('/api/state');
+    if (!res.ok) return;
+    const payload = await res.json();
+    if (payload && payload.loaded !== false && !payload.error) {
+      applyLoadedState(payload, true);
+    }
+  } catch (err) {
+    console.warn('Initial state fetch skipped:', err);
+  }
+}
+fetchInitialState();
 </script>
 </body>
 </html>
@@ -4848,10 +5144,32 @@ def serialize_analysis_state(
       "yy1_columns": analysis.yy1_columns,
       "yy1_fid_x": analysis.yy1_fid_x,
       "yy1_fid_y": analysis.yy1_fid_y,
+      "yy1_effective_fid_x": (
+          analysis.yy1_effective_fid_x
+          if analysis.yy1_effective_fid_x is not None
+          else analysis.yy1_fid_x
+      ),
+      "yy1_effective_fid_y": (
+          analysis.yy1_effective_fid_y
+          if analysis.yy1_effective_fid_y is not None
+          else analysis.yy1_fid_y
+      ),
       "yy1_offset_x": analysis.yy1_offset_x,
       "yy1_offset_y": analysis.yy1_offset_y,
       "yy1_rot_offset": analysis.yy1_rot_offset,
       "invert_rot_sign": analysis.invert_rot_sign,
+      "exclude_non_smd": analysis.exclude_non_smd,
+      "excluded_parts": analysis.excluded_parts,
+      "yy1_nozzle_changes": [
+          {
+              "enabled": nc.enabled,
+              "before_component": nc.before_component,
+              "head": nc.head,
+              "drop_station": nc.drop_station,
+              "pickup_station": nc.pickup_station,
+          }
+          for nc in analysis.yy1_nozzle_changes[:4]
+      ],
       "recommended_angle": analysis.recommended_angle_deg,
       "active_angle": active_angle,
       "recommended_method": analysis.recommended_method,
@@ -4892,7 +5210,7 @@ def serialize_analysis_state(
               "place_height": c.place_height,
               "yy1_mode": c.yy1_mode,
           }
-          for c in analysis.components[:500]
+          for c in analysis.components
       ],
   }
 
@@ -4903,14 +5221,26 @@ def snapshot_components(
   """
   Captures a deep copy of components, fiducials, panels, and YY1 reference settings
   so multi-step Undo and Redo work across inline edits, group edits, origin shifts,
-  feeder auto-assignment, component sorting, and bottom-side X-mirroring.
+  feeder auto-assignment, component sorting, bottom-side X-mirroring, and KiCad filter toggles.
   """
   return {
       "components": copy.deepcopy(analysis.components),
       "fiducials": copy.deepcopy(analysis.fiducials),
+      "cad_fiducials": copy.deepcopy(analysis.cad_fiducials),
       "panels": copy.deepcopy(analysis.panels),
+      "raw_lines": list(analysis.raw_lines),
+      "excluded_parts": list(analysis.excluded_parts),
+      "exclude_non_smd": analysis.exclude_non_smd,
+      "warnings": list(analysis.warnings),
+      "mirror_create_line_idx": analysis.mirror_create_line_idx,
+      "mirror_cols": analysis.mirror_cols,
+      "mirror_rows": analysis.mirror_rows,
+      "yy1_unit_length": analysis.yy1_unit_length,
+      "yy1_unit_width": analysis.yy1_unit_width,
       "yy1_fid_x": analysis.yy1_fid_x,
       "yy1_fid_y": analysis.yy1_fid_y,
+      "yy1_effective_fid_x": analysis.yy1_effective_fid_x,
+      "yy1_effective_fid_y": analysis.yy1_effective_fid_y,
   }
 
 
@@ -4922,9 +5252,33 @@ def restore_components_snapshot(
   if isinstance(snap, dict):
     analysis.components = copy.deepcopy(snap["components"])
     analysis.fiducials = copy.deepcopy(snap["fiducials"])
+    if "cad_fiducials" in snap:
+      analysis.cad_fiducials = copy.deepcopy(snap["cad_fiducials"])
     analysis.panels = copy.deepcopy(snap["panels"])
+    if "raw_lines" in snap:
+      analysis.raw_lines = list(snap["raw_lines"])
+    if "excluded_parts" in snap:
+      analysis.excluded_parts = list(snap["excluded_parts"])
+    if "exclude_non_smd" in snap:
+      analysis.exclude_non_smd = bool(snap["exclude_non_smd"])
+    if "warnings" in snap:
+      analysis.warnings = list(snap["warnings"])
+    if "mirror_create_line_idx" in snap:
+      analysis.mirror_create_line_idx = snap["mirror_create_line_idx"]
+    if "mirror_cols" in snap:
+      analysis.mirror_cols = snap["mirror_cols"]
+    if "mirror_rows" in snap:
+      analysis.mirror_rows = snap["mirror_rows"]
+    if "yy1_unit_length" in snap:
+      analysis.yy1_unit_length = snap["yy1_unit_length"]
+    if "yy1_unit_width" in snap:
+      analysis.yy1_unit_width = snap["yy1_unit_width"]
     analysis.yy1_fid_x = snap["yy1_fid_x"]
     analysis.yy1_fid_y = snap["yy1_fid_y"]
+    if "yy1_effective_fid_x" in snap:
+      analysis.yy1_effective_fid_x = snap["yy1_effective_fid_x"]
+    if "yy1_effective_fid_y" in snap:
+      analysis.yy1_effective_fid_y = snap["yy1_effective_fid_y"]
   else:
     analysis.components = copy.deepcopy(snap)
 
@@ -4933,6 +5287,7 @@ def launch_web_gui(
     initial_file: Optional[str] = None,
     port: int = 0,
     open_browser: bool = True,
+    exclude_non_smd: bool = True,
 ) -> None:
   """
   Launches the local 2-column Rufus-style HTTP GUI in the user's default browser.
@@ -4942,10 +5297,11 @@ def launch_web_gui(
       "undo_stack": [],
       "redo_stack": [],
       "last_batch_msg": "",
+      "active_angle": 0.0,
   }
 
   if initial_file and os.path.isfile(initial_file):
-    analysis = parse_neoden_csv(initial_file)
+    analysis = parse_neoden_csv(initial_file, exclude_non_smd=exclude_non_smd)
     default_target = (
         "neoden4" if analysis.source_format == "neoden" else "neoden_yy1"
     )
@@ -4955,6 +5311,10 @@ def launch_web_gui(
         target_format=default_target,
     )
     app_state["analysis"] = analysis
+    app_state["active_angle"] = analysis.recommended_angle_deg
+    app_state["last_batch_msg"] = (
+        "Loaded file. Edit part groups on the left or click any cell on the right."
+    )
 
   class Handler(BaseHTTPRequestHandler):
 
@@ -4963,38 +5323,79 @@ def launch_web_gui(
 
     def _send_json(self, data: Dict[str, Any], status: int = 200) -> None:
       raw = json.dumps(data).encode("utf-8")
-      self.send_response(status)
-      self.send_header("Content-Type", "application/json; charset=utf-8")
-      self.send_header("Content-Length", str(len(raw)))
-      self.end_headers()
-      self.wfile.write(raw)
+      try:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+      except (BrokenPipeError, ConnectionResetError):
+        pass
 
     def do_GET(self) -> None:
-      if self.path == "/" or self.path.startswith("/index.html"):
-        raw = RUFUS_WEB_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-        return
+      try:
+        if self.path == "/" or self.path.startswith("/index.html"):
+          raw = RUFUS_WEB_HTML.encode("utf-8")
+          self.send_response(200)
+          self.send_header("Content-Type", "text/html; charset=utf-8")
+          self.send_header("Content-Length", str(len(raw)))
+          self.end_headers()
+          self.wfile.write(raw)
+          return
 
-      if self.path.startswith("/help"):
-        raw = HELP_PAGE_HTML.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-        return
+        if self.path.startswith("/help"):
+          raw = HELP_PAGE_HTML.encode("utf-8")
+          self.send_response(200)
+          self.send_header("Content-Type", "text/html; charset=utf-8")
+          self.send_header("Content-Length", str(len(raw)))
+          self.end_headers()
+          self.wfile.write(raw)
+          return
 
-      self.send_error(404)
+        if self.path == "/api/state":
+          analysis = app_state.get("analysis")
+          if analysis is None:
+            self._send_json({"loaded": False})
+          else:
+            self._send_json(
+                serialize_analysis_state(
+                    analysis,
+                    app_state.get("active_angle", analysis.recommended_angle_deg),
+                    can_undo=bool(app_state["undo_stack"]),
+                    can_redo=bool(app_state["redo_stack"]),
+                    batch_message=app_state["last_batch_msg"],
+                )
+            )
+          return
+
+        self.send_error(404)
+      except (BrokenPipeError, ConnectionResetError):
+        pass
+
+    def _sync_req_from_analysis(
+        self, analysis: NeoDenCSVAnalysis, req: Dict[str, Any]
+    ) -> None:
+      if analysis.panels:
+        req["p1_x"] = analysis.panels[0].x
+        req["p1_y"] = analysis.panels[0].y
+      elif analysis.components:
+        req["p1_x"] = analysis.components[0].x
+        req["p1_y"] = analysis.components[0].y
+      req["yy1_fid_x"] = analysis.yy1_fid_x
+      req["yy1_fid_y"] = analysis.yy1_fid_y
 
     def _run_preview_from_req(
         self, analysis: NeoDenCSVAnalysis, req: Dict[str, Any]
     ) -> float:
       rot_mode = req.get("rot_mode", "auto")
-      update_fiducial_usage_for_mode(analysis, rot_mode)
+      cad_dx_val = req.get("cad_dx")
+      cad_dy_val = req.get("cad_dy")
+      update_fiducial_usage_for_mode(
+          analysis,
+          rot_mode,
+          cad_dx=float(cad_dx_val) if cad_dx_val is not None else None,
+          cad_dy=float(cad_dy_val) if cad_dy_val is not None else None,
+      )
       ang = float(req.get("board_angle", 0.0))
       p1x = req.get("p1_x")
       p1y = req.get("p1_y")
@@ -5069,6 +5470,7 @@ def launch_web_gui(
           comp_rot_offset_deg=analysis.yy1_rot_offset,
           invert_rot_sign=analysis.invert_rot_sign,
       )
+      app_state["active_angle"] = ang
       return ang
 
     def do_POST(self) -> None:
@@ -5083,8 +5485,12 @@ def launch_web_gui(
           parsed = urllib.parse.urlparse(self.path)
           qs = urllib.parse.parse_qs(parsed.query)
           fname = qs.get("filename", ["uploaded.csv"])[0]
+          excl_param = qs.get("exclude_non_smd", ["1"])[0].lower()
+          exclude_non_smd_flag = excl_param not in ("0", "false", "no")
           save_target = os.path.join(os.getcwd(), os.path.basename(fname))
-          analysis = parse_neoden_csv_bytes(body, filepath=save_target)
+          analysis = parse_neoden_csv_bytes(
+              body, filepath=save_target, exclude_non_smd=exclude_non_smd_flag
+          )
           default_target = (
               "neoden4" if analysis.source_format == "neoden" else "neoden_yy1"
           )
@@ -5096,6 +5502,7 @@ def launch_web_gui(
           app_state["analysis"] = analysis
           app_state["undo_stack"] = []
           app_state["redo_stack"] = []
+          app_state["active_angle"] = analysis.recommended_angle_deg
           app_state["last_batch_msg"] = (
               "Loaded file. Edit part groups on the left or click any cell on the right."
           )
@@ -5116,6 +5523,47 @@ def launch_web_gui(
           return
 
         req = json.loads(body.decode("utf-8")) if body else {}
+
+        if self.path == "/api/reparse_kicad":
+          if not analysis.raw_source_bytes:
+            raise ValueError(
+                "Original source file bytes are unavailable for re-parsing."
+            )
+          snap = snapshot_components(analysis)
+          excl = bool(req.get("exclude_non_smd", True))
+          cad_dx_val = req.get("cad_dx")
+          cad_dy_val = req.get("cad_dy")
+          new_analysis = parse_neoden_csv_bytes(
+              analysis.raw_source_bytes,
+              filepath=analysis.filepath,
+              cad_dx=float(cad_dx_val) if cad_dx_val is not None else None,
+              cad_dy=float(cad_dy_val) if cad_dy_val is not None else None,
+              exclude_non_smd=excl,
+          )
+          app_state["undo_stack"].append(snap)
+          app_state["redo_stack"].clear()
+          app_state["analysis"] = new_analysis
+          analysis = new_analysis
+          app_state["last_batch_msg"] = (
+              f"Re-parsed KiCad .pos with non-SMD auto-exclude {'ON' if excl else 'OFF'}"
+              f" ({len(analysis.components)} component(s), {len(analysis.excluded_parts)} excluded)."
+          )
+          self._sync_req_from_analysis(analysis, req)
+          req["yy1_unit_length"] = analysis.yy1_unit_length
+          req["yy1_unit_width"] = analysis.yy1_unit_width
+          req["yy1_rows"] = analysis.yy1_rows
+          req["yy1_columns"] = analysis.yy1_columns
+          ang = self._run_preview_from_req(analysis, req)
+          self._send_json(
+              serialize_analysis_state(
+                  analysis,
+                  ang,
+                  can_undo=bool(app_state["undo_stack"]),
+                  can_redo=bool(app_state["redo_stack"]),
+                  batch_message=app_state["last_batch_msg"],
+              )
+          )
+          return
 
         if self.path == "/api/preview":
           ang = self._run_preview_from_req(analysis, req)
@@ -5160,6 +5608,8 @@ def launch_web_gui(
           app_state["undo_stack"].append(snap)
           app_state["redo_stack"].clear()
           app_state["last_batch_msg"] = msg
+          if row_idx == 0:
+            self._sync_req_from_analysis(analysis, req)
           ang = self._run_preview_from_req(analysis, req)
           self._send_json(
               serialize_analysis_state(
@@ -5203,11 +5653,7 @@ def launch_web_gui(
           app_state["undo_stack"].append(snap)
           app_state["redo_stack"].clear()
           app_state["last_batch_msg"] = msg
-          if analysis.panels:
-            req["p1_x"] = analysis.panels[0].x
-            req["p1_y"] = analysis.panels[0].y
-          req["yy1_fid_x"] = analysis.yy1_fid_x
-          req["yy1_fid_y"] = analysis.yy1_fid_y
+          self._sync_req_from_analysis(analysis, req)
           ang = self._run_preview_from_req(analysis, req)
           self._send_json(
               serialize_analysis_state(
@@ -5264,6 +5710,7 @@ def launch_web_gui(
           app_state["undo_stack"].append(snap)
           app_state["redo_stack"].clear()
           app_state["last_batch_msg"] = msg
+          self._sync_req_from_analysis(analysis, req)
           ang = self._run_preview_from_req(analysis, req)
           self._send_json(
               serialize_analysis_state(
@@ -5282,11 +5729,9 @@ def launch_web_gui(
             prev_snap = app_state["undo_stack"].pop()
             restore_components_snapshot(analysis, prev_snap)
             app_state["last_batch_msg"] = "Undid last modification."
-            if analysis.panels:
-              req["p1_x"] = analysis.panels[0].x
-              req["p1_y"] = analysis.panels[0].y
-            req["yy1_fid_x"] = analysis.yy1_fid_x
-            req["yy1_fid_y"] = analysis.yy1_fid_y
+            self._sync_req_from_analysis(analysis, req)
+            req["yy1_unit_length"] = analysis.yy1_unit_length
+            req["yy1_unit_width"] = analysis.yy1_unit_width
           ang = self._run_preview_from_req(analysis, req)
           self._send_json(
               serialize_analysis_state(
@@ -5305,11 +5750,9 @@ def launch_web_gui(
             next_snap = app_state["redo_stack"].pop()
             restore_components_snapshot(analysis, next_snap)
             app_state["last_batch_msg"] = "Redid modification."
-            if analysis.panels:
-              req["p1_x"] = analysis.panels[0].x
-              req["p1_y"] = analysis.panels[0].y
-            req["yy1_fid_x"] = analysis.yy1_fid_x
-            req["yy1_fid_y"] = analysis.yy1_fid_y
+            self._sync_req_from_analysis(analysis, req)
+            req["yy1_unit_length"] = analysis.yy1_unit_length
+            req["yy1_unit_width"] = analysis.yy1_unit_width
           ang = self._run_preview_from_req(analysis, req)
           self._send_json(
               serialize_analysis_state(
@@ -5389,11 +5832,11 @@ def launch_web_gui(
 
       self.send_error(404)
 
-  server = HTTPServer(("127.0.0.1", port), Handler)
+  server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
   actual_port = server.server_port
   url = f"http://127.0.0.1:{actual_port}/"
   print("=================================================================")
-  print(f" NeoDen YY1 & NeoDen 4 CSV / KiCad .pos Utility v7.0 at: {url}")
+  print(f" NeoDen YY1 & NeoDen 4 CSV / KiCad .pos Utility v7.5 at: {url}")
   print(f" Help & Workflow Guide available at: {url}help")
   print(" (Press Ctrl+C in this terminal window when you are done)")
   print("=================================================================")
@@ -5415,7 +5858,7 @@ def main() -> int:
   parser = argparse.ArgumentParser(
       description=(
           "NeoDen YY1 & NeoDen 4 Pick-and-Place CSV & KiCad .pos Converter"
-          " Utility (v7.0). Run without arguments to launch the 2-column GUI."
+          " Utility (v7.5). Run without arguments to launch the 2-column GUI."
       )
   )
   parser.add_argument(
@@ -5554,6 +5997,14 @@ def main() -> int:
       action="store_true",
       help="Keep original mirror_create PCB angle instead of resetting to 0",
   )
+  parser.add_argument(
+      "--include-all-parts",
+      action="store_true",
+      help=(
+          "Include connectors (J*), pin headers, switches (SW*), test points (TP*),"
+          " and THT parts when importing a KiCad .pos CSV"
+      ),
+  )
   skip_grp = parser.add_mutually_exclusive_group()
   skip_grp.add_argument(
       "--unskip-all",
@@ -5602,15 +6053,23 @@ def main() -> int:
           or args.skips_off
           or args.skips_on
           or args.first_only
+          or args.include_all_parts
       )
   )
 
+  exclude_non_smd = not args.include_all_parts
+
   if not is_cli_transform:
-    launch_web_gui(initial_file=args.input_csv)
+    launch_web_gui(
+        initial_file=args.input_csv, exclude_non_smd=exclude_non_smd
+    )
     return 0
 
   analysis = parse_neoden_csv(
-      args.input_csv, cad_dx=args.cad_dx, cad_dy=args.cad_dy
+      args.input_csv,
+      cad_dx=args.cad_dx,
+      cad_dy=args.cad_dy,
+      exclude_non_smd=exclude_non_smd,
   )
 
   if not target_fmt:
@@ -5641,9 +6100,7 @@ def main() -> int:
     chosen_angle = args.angle
     chosen_method = "Manual CLI Override"
   elif args.all_edges and analysis.edge_angles:
-    chosen_angle = sum(analysis.edge_angles.values()) / len(
-        analysis.edge_angles
-    )
+    chosen_angle = _circular_mean_deg(list(analysis.edge_angles.values()))
     chosen_method = "Average of All Fiducial Edges"
   else:
     chosen_angle = analysis.recommended_angle_deg
@@ -5698,7 +6155,7 @@ def main() -> int:
   no_cnt = sum(1 for c in analysis.components if c.skip == "No")
   yes_cnt = len(analysis.components) - no_cnt
 
-  print("=== NeoDen YY1 & NeoDen 4 CSV / KiCad .pos Utility v7.0 Summary ===")
+  print("=== NeoDen YY1 & NeoDen 4 CSV / KiCad .pos Utility v7.5 Summary ===")
   print(f"Input File       : {args.input_csv} (format: {analysis.source_format})")
   print(f"Target Format    : {target_fmt}")
   print(f"Output File      : {out_path}")
